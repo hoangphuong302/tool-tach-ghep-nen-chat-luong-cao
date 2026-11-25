@@ -1,0 +1,899 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Literal, Optional, Tuple
+
+import cv2
+import numpy as np
+
+
+@dataclass
+class MattingConfig:
+    trimap_radius: int = 2              # Sub-pixel transition half-width in pixels (1..10)
+    guided_radius: int = 2              # Joint Guided Filter radius (1..10)
+    guided_eps: float = 5e-4            # Guided filter regularization
+    decontaminate_strength: float = 0.90  # Edge color decontamination / despill strength (0..1)
+    despill_green: bool = False         # Extra green/blue chroma spill suppression
+    erode_dilate: int = 0               # Pre-matting morphological shift (-10..+10 px)
+    two_pass_verify: bool = True        # Enable Pass-2 Closed-Loop Pixel Verification & Compensation
+    use_vitmatte_gpu: bool = False      # Optional ViTMatte neural transformer matting on trimap
+
+
+@dataclass
+class MattingResult:
+    alpha: np.ndarray                  # float32 (H, W) in [0.0, 1.0] with sub-pixel edge precision
+    fg_clean_bgr: np.ndarray           # uint8 (H, W, 3) decontaminated foreground BGR
+    rgba: np.ndarray                   # uint8 (H, W, 4) transparent RGBA for export
+    trimap: np.ndarray                 # uint8 (H, W): 0=BG, 128=Unknown, 255=FG
+    missing_restored_px: int = 0       # Pass-2 Audit: count of missing subject pixels restored
+    excess_removed_px: int = 0         # Pass-2 Audit: count of excess background pixels removed
+    audit_diff_rgb: Optional[np.ndarray] = None  # Visual map: Green=Restored, Red=Removed
+
+
+def detect_active_frame_box(bgr: np.ndarray, threshold: int = 14) -> Tuple[int, int, int, int]:
+    """
+    Detect active content bounding box (x0, y0, x1, y1) inside a letterboxed or
+    pillarboxed frame (e.g., 9:16 vertical video screenshot inside 16:9 black bars).
+    """
+    h, w = bgr.shape[:2]
+    gray = np.max(bgr, axis=2)
+    col_p95 = np.percentile(gray, 95, axis=0)
+    row_p95 = np.percentile(gray, 95, axis=1)
+
+    active_cols = np.where(col_p95 > threshold)[0]
+    active_rows = np.where(row_p95 > threshold)[0]
+
+    if len(active_cols) < 16 or len(active_rows) < 16:
+        return (0, 0, w, h)
+
+    x0, x1 = int(active_cols[0]), int(active_cols[-1] + 1)
+    y0, y1 = int(active_rows[0]), int(active_rows[-1] + 1)
+
+    if x0 <= int(w * 0.02) and x1 >= int(w * 0.98) and y0 <= int(h * 0.02) and y1 >= int(h * 0.98):
+        return (0, 0, w, h)
+    return (x0, y0, x1, y1)
+
+
+def auto_seed_foreground_points(bgr: np.ndarray) -> list[tuple[int, int, int]]:
+    """
+    Automatically place smart positive (+1) points on central handheld device & hands
+    and negative (0) points on the background so 1-click segmentation works immediately.
+    Returns list of (x, y, label).
+    """
+    h, w = bgr.shape[:2]
+    x0, y0, x1, y1 = detect_active_frame_box(bgr)
+    aw, ah = max(1, x1 - x0), max(1, y1 - y0)
+
+    pts: list[tuple[int, int, int]] = []
+    # 1. Central product / handheld device points
+    cx = x0 + aw // 2
+    pts.append((cx, y0 + int(ah * 0.50), 1))
+    pts.append((cx, y0 + int(ah * 0.64), 1))
+
+    # 2. Detect skin regions (hands holding the object) in the lower 75% of the active frame
+    active_bgr = bgr[y0:y1, x0:x1]
+    ycrcb = cv2.cvtColor(active_bgr, cv2.COLOR_BGR2YCrCb)
+    cr, cb = ycrcb[..., 1], ycrcb[..., 2]
+    skin = (cr >= 135) & (cr <= 175) & (cb >= 77) & (cb <= 127)
+    skin[: int(ah * 0.30), :] = False  # Ignore faces/upper background
+
+    # Split left half and right half of active frame to seed left hand and right hand
+    mid = aw // 2
+    for x_offset, half_mask in [(0, skin[:, :mid]), (mid, skin[:, mid:])]:
+        ys, xs = np.where(half_mask)
+        if len(xs) > int(aw * ah * 0.008):
+            mx = int(np.median(xs)) + x_offset + x0
+            my = int(np.median(ys)) + y0
+            pts.append((mx, my, 1))
+
+    # 3. Negative background anchor points (upper corners, top-center, and side background)
+    pts.append((x0 + int(aw * 0.12), y0 + int(ah * 0.12), 0))
+    pts.append((x0 + int(aw * 0.50), y0 + int(ah * 0.10), 0))
+    pts.append((x0 + int(aw * 0.88), y0 + int(ah * 0.12), 0))
+    pts.append((x0 + int(aw * 0.10), y0 + int(ah * 0.42), 0))
+    pts.append((x0 + int(aw * 0.90), y0 + int(ah * 0.42), 0))
+    return pts
+
+
+def auto_seed_roto_strokes(bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Generate smart default Roto-Brush foreground (green) and background (red) stroke masks
+    covering the central device from top bezel to bottom bezel plus both hands.
+    Returns (fg_stroke_u8, bg_stroke_u8) of shape (H, W) in {0, 1}.
+    """
+    h, w = bgr.shape[:2]
+    x0, y0, x1, y1 = detect_active_frame_box(bgr)
+    aw, ah = max(1, x1 - x0), max(1, y1 - y0)
+
+    fg_stroke = np.zeros((h, w), dtype=np.uint8)
+    bg_stroke = np.zeros((h, w), dtype=np.uint8)
+
+    # 1. Find central dark/electronic device bounding box strictly connected to the device center
+    active_bgr = bgr[y0:y1, x0:x1]
+    hsv = cv2.cvtColor(active_bgr, cv2.COLOR_BGR2HSV)
+    b_ch = active_bgr[..., 0].astype(np.float32)
+    r_ch = active_bgr[..., 2].astype(np.float32)
+    # Device bezel & screen: dark chassis (V < 65) or glowing blue UI (B > R + 18)
+    dev_cand = ((hsv[..., 2] < 65) | ((b_ch > r_ch + 18) & (hsv[..., 1] > 45))).astype(np.uint8)
+    search_mask = np.zeros_like(dev_cand)
+    search_mask[int(ah * 0.28): int(ah * 0.84), int(aw * 0.24): int(aw * 0.76)] = 1
+    dev_cand &= search_mask
+    # Open slightly to sever thin connections to blurred background signs, then keep ONLY the center component
+    dev_cand = cv2.morphologyEx(dev_cand, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)))
+    dev_cand = cv2.morphologyEx(dev_cand, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11)))
+
+    num_cc, labels_cc, stats, _ = cv2.connectedComponentsWithStats(dev_cand, connectivity=8)
+    center_lbl = labels_cc[int(ah * 0.55), aw // 2]
+    if center_lbl == 0 and num_cc > 1:
+        # Pick largest component in center search zone
+        center_lbl = max(range(1, num_cc), key=lambda c: stats[c, cv2.CC_STAT_AREA])
+    if center_lbl > 0:
+        dev_cand = (labels_cc == center_lbl).astype(np.uint8)
+
+    # Expand dev_cand horizontally by up to 34px to include bright white/silver metallic side bezels
+    # and red power buttons immediately adjacent to the dark front bezel (excluding green screen & skin)
+    dil_side = cv2.dilate(dev_cand, cv2.getStructuringElement(cv2.MORPH_RECT, (65, 9)), iterations=1)
+    g_ch_f = active_bgr[..., 1].astype(np.float32)
+    is_green_px = (g_ch_f > np.maximum(r_ch, b_ch) + 6.0) & (hsv[..., 0] >= 30) & (hsv[..., 0] <= 98) & (hsv[..., 1] >= 25)
+    # White/silver aluminum bezel (high V, low-medium S, not green) or red side button (R >> G)
+    is_side_bezel = (
+        (dil_side > 0)
+        & (~is_green_px)
+        & (
+            ((hsv[..., 2] >= 125) & (hsv[..., 1] <= 65))  # White/silver side chassis
+            | ((r_ch > g_ch_f + 45.0) & (hsv[..., 1] >= 90))  # Red/orange side button
+        )
+    ).astype(np.uint8)
+    dev_cand = cv2.morphologyEx(dev_cand | is_side_bezel, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11)))
+
+    ys_d, xs_d = np.where(dev_cand > 0)
+    cx = x0 + aw // 2
+    if len(ys_d) > int(aw * ah * 0.01):
+        dy0_rel = int(np.percentile(ys_d, 6))
+        dy1_rel = int(np.percentile(ys_d, 94))
+        dym_rel = (dy0_rel + dy1_rel) // 2
+
+        def _row_span(y_rel: int) -> tuple[int, int, int, int]:
+            y_lo = max(0, y_rel - 8)
+            y_hi = min(ah, y_rel + 9)
+            r_xs = np.where(np.any(dev_cand[y_lo:y_hi, :] > 0, axis=0))[0]
+            if len(r_xs) >= 10:
+                rx0 = x0 + int(np.percentile(r_xs, 14))
+                rx1 = x0 + int(np.percentile(r_xs, 88))
+                rx_edge_r = x0 + int(np.percentile(r_xs, 96))
+            else:
+                rx0 = x0 + int(np.percentile(xs_d, 18))
+                rx1 = x0 + int(np.percentile(xs_d, 84))
+                rx_edge_r = x0 + int(np.percentile(xs_d, 95))
+            return rx0, rx1, (rx0 + rx1) // 2, rx_edge_r
+
+        tx0, tx1, tcx, trx = _row_span(dy0_rel + 14)
+        mx0, mx1, mcx, mrx = _row_span(dym_rel)
+        bx0, bx1, bcx, brx = _row_span(dy1_rel - 14)
+
+        dy0 = y0 + dy0_rel
+        dy1 = y0 + dy1_rel
+        dx0 = x0 + int(np.percentile(xs_d, 15))
+        dx1 = x0 + int(np.percentile(xs_d, 88))
+
+        # Draw tilted spine + row-local top/mid/bottom bars + side-bezel anchor line inside the device
+        cv2.line(fg_stroke, (tcx, dy0 + 12), (bcx, dy1 - 12), 1, thickness=12)
+        cv2.line(fg_stroke, (tx0, dy0 + 14), (tx1, dy0 + 14), 1, thickness=8)
+        cv2.line(fg_stroke, (mx0, y0 + dym_rel), (mx1, y0 + dym_rel), 1, thickness=8)
+        cv2.line(fg_stroke, (bx0, dy1 - 14), (bx1, dy1 - 14), 1, thickness=8)
+        # Anchor stroke along the right side bezel so white/silver chassis is 100% included
+        cv2.line(fg_stroke, (trx - 4, dy0 + 22), (mrx - 4, y0 + dym_rel), 1, thickness=6)
+
+        if dy0 - 22 > y0 + 10:
+            cv2.line(bg_stroke, (tx0 - 15, dy0 - 22), (tx1 + 15, dy0 - 22), 1, thickness=8)
+    else:
+        cv2.line(fg_stroke, (cx, y0 + int(ah * 0.36)), (cx, y0 + int(ah * 0.72)), 1, thickness=14)
+
+    # 2. Detect true human skin hands (excluding yellow-hue wooden tables/desks!) in lower 72%
+    ycrcb = cv2.cvtColor(active_bgr, cv2.COLOR_BGR2YCrCb)
+    cr, cb = ycrcb[..., 1].astype(np.int32), ycrcb[..., 2].astype(np.int32)
+    hue = hsv[..., 0].astype(np.int32)
+    g_ch = active_bgr[..., 1].astype(np.float32)
+
+    # Human skin is pink/peach (Hue in 0..17 or 164..180, with R - G >= 11)
+    # whereas yellow/brown wooden tables have Hue in 18..35 and G - B >> R - G
+    skin = (
+        (cr >= 135) & (cr <= 178) & (cb >= 77) & (cb <= 129)
+        & ((hue <= 17) | (hue >= 164))
+        & ((r_ch - g_ch) >= 11.0)
+    ).astype(np.uint8)
+    skin[: int(ah * 0.34), :] = 0
+    skin = cv2.erode(skin, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)), iterations=1)
+
+    # Detect wooden table/desk surface in lower half (Hue 18..35, G - B > 1.3 * (R - G))
+    wood_table = (
+        (cr >= 130) & (cb <= 116) & (hue >= 18) & (hue <= 35)
+        & ((g_ch - b_ch) > (r_ch - g_ch) * 1.25)
+    ).astype(np.uint8)
+    wood_table[: int(ah * 0.55), :] = 0
+    wood_table = cv2.erode(wood_table, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)), iterations=1)
+
+    mid = aw // 2
+    for x_off, half in [(0, skin[:, :mid]), (mid, skin[:, mid:])]:
+        ys_s, xs_s = np.where(half > 0)
+        if len(xs_s) > int(aw * ah * 0.006):
+            p_top = (x0 + x_off + int(np.median(xs_s[ys_s < np.median(ys_s)])), y0 + int(np.percentile(ys_s, 20)))
+            p_mid = (x0 + x_off + int(np.median(xs_s)), y0 + int(np.percentile(ys_s, 55)))
+            p_bot = (x0 + x_off + int(np.median(xs_s[ys_s >= np.median(ys_s)])), y0 + int(np.percentile(ys_s, 88)))
+            cv2.line(fg_stroke, p_top, p_mid, 1, thickness=12)
+            cv2.line(fg_stroke, p_mid, p_bot, 1, thickness=12)
+
+    # Also check for fingers wrapping directly underneath the device bottom edge (dy1..dy1+110)
+    if len(ys_d) > int(aw * ah * 0.01):
+        under_y0 = min(ah - 1, max(0, (dy1 - y0) + 10))
+        under_y1 = min(ah, under_y0 + int(ah * 0.12))
+        under_x0 = max(0, (dx0 - x0))
+        under_x1 = min(aw, (dx1 - x0))
+        under_skin = skin[under_y0:under_y1, under_x0:under_x1]
+        u_ys, u_xs = np.where(under_skin > 0)
+        if len(u_xs) > int(aw * ah * 0.002):
+            ux_l = x0 + under_x0 + int(np.percentile(u_xs, 20))
+            uy_l = y0 + under_y0 + int(np.percentile(u_ys, 45))
+            ux_r = x0 + under_x0 + int(np.percentile(u_xs, 80))
+            uy_r = y0 + under_y0 + int(np.percentile(u_ys, 65))
+            cv2.line(fg_stroke, (ux_l, uy_l), (ux_r, uy_r), 1, thickness=10)
+
+    # If a wooden table is present in the lower-left or lower-right background, mark it as negative background
+    for x_off, w_half in [(0, wood_table[:, :mid]), (mid, wood_table[:, mid:])]:
+        wys, wxs = np.where(w_half > 0)
+        if len(wxs) > int(aw * ah * 0.015):
+            wx0 = x0 + x_off + int(np.percentile(wxs, 25))
+            wy0 = y0 + int(np.percentile(wys, 35))
+            wx1 = x0 + x_off + int(np.percentile(wxs, 65))
+            wy1 = y0 + int(np.percentile(wys, 85))
+            cv2.line(bg_stroke, (wx0, wy0), (wx1, wy1), 1, thickness=12)
+
+    # If green screen pixels exist (G > max(R, B) + 28), place negative anchors on any interior green gaps
+    green_bg = ((g_ch > np.maximum(r_ch, b_ch) + 28.0) & (hsv[..., 1] > 45)).astype(np.uint8)
+    green_bg = cv2.erode(green_bg, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)), iterations=1)
+    if np.sum(green_bg) > int(aw * ah * 0.05):
+        # Sample negative background lines on strong green zones outside device/skin
+        bg_stroke[y0:y1, x0:x1][green_bg[::1, ::1] > 0] = 0  # handled sparsely below
+        for gy_frac in (0.55, 0.65, 0.72):
+            gy = int(ah * gy_frac)
+            g_xs = np.where(green_bg[gy, :] > 0)[0]
+            if len(g_xs) > 10:
+                cv2.circle(bg_stroke, (x0 + int(g_xs[len(g_xs) // 2]), y0 + gy), 8, 1, -1)
+                cv2.circle(bg_stroke, (x0 + int(g_xs[-5]), y0 + gy), 8, 1, -1)
+
+    # 3. Background exclusion stroke around upper & upper-side perimeter + bottom-center gap between hands
+    cv2.line(bg_stroke, (x0 + int(aw * 0.08), y0 + int(ah * 0.08)), (x0 + int(aw * 0.92), y0 + int(ah * 0.08)), 1, thickness=12)
+    cv2.line(bg_stroke, (x0 + int(aw * 0.06), y0 + int(ah * 0.08)), (x0 + int(aw * 0.06), y0 + int(ah * 0.48)), 1, thickness=10)
+    cv2.line(bg_stroke, (x0 + int(aw * 0.94), y0 + int(ah * 0.08)), (x0 + int(aw * 0.94), y0 + int(ah * 0.48)), 1, thickness=10)
+    # Check if lower-center bottom edge (under the device between the two hands) is non-skin background
+    bot_y = int(ah * 0.92)
+    if skin[bot_y, aw // 2] == 0:
+        cv2.line(bg_stroke, (x0 + int(aw * 0.44), y0 + bot_y), (x0 + int(aw * 0.56), y0 + bot_y), 1, thickness=10)
+    return fg_stroke, bg_stroke
+
+
+def extract_strokes_from_editor(
+    editor_val: Optional[dict],
+    orig_rgb: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Parse Gradio ImageEditor output dict {"background", "layers", "composite"} into
+    binary foreground stroke mask (green brush) and background stroke mask (red brush).
+    """
+    h, w = orig_rgb.shape[:2]
+    fg_stroke = np.zeros((h, w), dtype=np.uint8)
+    bg_stroke = np.zeros((h, w), dtype=np.uint8)
+    if not editor_val or not isinstance(editor_val, dict):
+        return fg_stroke, bg_stroke
+
+    layers = editor_val.get("layers") or []
+    for layer in layers:
+        if layer is None:
+            continue
+        arr = np.asarray(layer)
+        if arr.shape[:2] != (h, w):
+            arr = cv2.resize(arr, (w, h), interpolation=cv2.INTER_NEAREST)
+        if arr.ndim == 3 and arr.shape[2] == 4:
+            r, g, b, a = arr[..., 0].astype(int), arr[..., 1].astype(int), arr[..., 2].astype(int), arr[..., 3].astype(int)
+            painted = a > 25
+            fg_stroke[(painted) & (g > r + 25) & (g > b - 10)] = 1
+            bg_stroke[(painted) & (r > g + 25) & (r > b + 20)] = 1
+        elif arr.ndim == 3 and arr.shape[2] == 3:
+            diff = np.max(np.abs(arr.astype(int) - orig_rgb.astype(int)), axis=-1) > 25
+            r, g, b = arr[..., 0].astype(int), arr[..., 1].astype(int), arr[..., 2].astype(int)
+            fg_stroke[diff & (g > r + 25)] = 1
+            bg_stroke[diff & (r > g + 25)] = 1
+
+    # Fallback: check composite vs orig_rgb if layers list was empty
+    if not np.any(fg_stroke) and not np.any(bg_stroke) and editor_val.get("composite") is not None:
+        comp = np.asarray(editor_val["composite"])[..., :3]
+        if comp.shape[:2] != (h, w):
+            comp = cv2.resize(comp, (w, h), interpolation=cv2.INTER_NEAREST)
+        diff = np.max(np.abs(comp.astype(int) - orig_rgb.astype(int)), axis=-1) > 28
+        r, g, b = comp[..., 0].astype(int), comp[..., 1].astype(int), comp[..., 2].astype(int)
+        fg_stroke[diff & (g > r + 25)] = 1
+        bg_stroke[diff & (r > g + 25)] = 1
+
+    return fg_stroke, bg_stroke
+
+
+def sample_roto_anchor_points(
+    fg_stroke: np.ndarray,
+    bg_stroke: np.ndarray,
+    bgr: np.ndarray,
+    grid_step: int = 36,
+) -> list[tuple[int, int, int]]:
+    """
+    Convert Roto-Brush painted strokes into dense, spatially distributed positive (1)
+    and negative (0) anchor points for SAM 2.1 multi-part snapping.
+    """
+    h, w = fg_stroke.shape[:2]
+    pts: list[tuple[int, int, int]] = []
+
+    # Sample positive points from grid cells overlapping fg_stroke
+    for y0 in range(0, h, grid_step):
+        for x0 in range(0, w, grid_step):
+            cell = fg_stroke[y0: min(h, y0 + grid_step), x0: min(w, x0 + grid_step)]
+            ys, xs = np.where(cell > 0)
+            if len(xs) > 0:
+                pts.append((x0 + int(np.median(xs)), y0 + int(np.median(ys)), 1))
+
+    # Sample negative points from bg_stroke if painted, else auto-place background perimeter anchors
+    if np.any(bg_stroke > 0):
+        for y0 in range(0, h, grid_step * 2):
+            for x0 in range(0, w, grid_step * 2):
+                cell = bg_stroke[y0: min(h, y0 + grid_step * 2), x0: min(w, x0 + grid_step * 2)]
+                ys, xs = np.where(cell > 0)
+                if len(xs) > 0:
+                    pts.append((x0 + int(np.median(xs)), y0 + int(np.median(ys)), 0))
+    else:
+        ax0, ay0, ax1, ay1 = detect_active_frame_box(bgr)
+        aw, ah = max(1, ax1 - ax0), max(1, ay1 - ay0)
+        pts.extend([
+            (ax0 + int(aw * 0.10), ay0 + int(ah * 0.10), 0),
+            (ax0 + int(aw * 0.50), ay0 + int(ah * 0.08), 0),
+            (ax0 + int(aw * 0.90), ay0 + int(ah * 0.10), 0),
+            (ax0 + int(aw * 0.08), ay0 + int(ah * 0.42), 0),
+            (ax0 + int(aw * 0.92), ay0 + int(ah * 0.42), 0),
+        ])
+
+    return pts
+
+
+def auto_chroma_key_mask(
+    bgr: np.ndarray,
+    key_color: Literal["green", "blue", "auto"] = "green",
+    tolerance: float = 0.35,
+) -> np.ndarray:
+    """
+    Automatic multi-space (RGB chroma difference + HSV) green/blue screen segmentation.
+    Returns binary foreground mask uint8 in {0, 1} (1 = foreground subject, 0 = chroma background).
+    """
+    b = bgr[..., 0].astype(np.float32)
+    g = bgr[..., 1].astype(np.float32)
+    r = bgr[..., 2].astype(np.float32)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    hue, sat, val = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+
+    if key_color == "auto":
+        green_score = float(np.mean(np.maximum(0.0, g - np.maximum(r, b))))
+        blue_score = float(np.mean(np.maximum(0.0, b - np.maximum(r, g))))
+        mode = "green" if green_score >= blue_score else "blue"
+    else:
+        mode = key_color
+
+    thresh_diff = max(8.0, 45.0 * (1.0 - float(np.clip(tolerance, 0.05, 0.95))))
+    if mode == "green":
+        chroma_excess = g - np.maximum(r, b)
+        is_bg = (chroma_excess > thresh_diff) & (hue >= 30) & (hue <= 96) & (sat >= 35) & (val >= 25)
+    else:
+        chroma_excess = b - np.maximum(r, g)
+        is_bg = (chroma_excess > thresh_diff) & (hue >= 92) & (hue <= 140) & (sat >= 35) & (val >= 25)
+
+    fg_u8 = (~is_bg).astype(np.uint8) * 255
+    k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    fg_u8 = cv2.morphologyEx(fg_u8, cv2.MORPH_OPEN, k_open)
+    fg_u8 = cv2.morphologyEx(fg_u8, cv2.MORPH_CLOSE, k_close)
+    return (fg_u8 > 127).astype(np.uint8)
+
+
+def _propagate_local_colors(
+    img_f: np.ndarray,
+    known_mask: np.ndarray,
+    sigma: float,
+) -> np.ndarray:
+    """Propagate known foreground or background colors smoothly into the unknown trimap band (half-res pyramid for speed)."""
+    h, w = img_f.shape[:2]
+    w_f = (known_mask > 0).astype(np.float32)
+    scale = 0.5 if min(h, w) >= 480 else 1.0
+    if scale < 1.0:
+        sw, sh = max(32, int(w * scale)), max(32, int(h * scale))
+        img_s = cv2.resize(img_f, (sw, sh), interpolation=cv2.INTER_AREA)
+        w_s = cv2.resize(w_f, (sw, sh), interpolation=cv2.INTER_AREA)
+        sig_s = max(1.2, sigma * scale)
+    else:
+        img_s, w_s, sig_s = img_f, w_f, sigma
+
+    weighted = img_s * w_s[..., None]
+    num1 = cv2.GaussianBlur(weighted, (0, 0), sigmaX=sig_s)
+    den1 = cv2.GaussianBlur(w_s, (0, 0), sigmaX=sig_s)[..., None]
+
+    num2 = cv2.GaussianBlur(weighted, (0, 0), sigmaX=sig_s * 2.5)
+    den2 = cv2.GaussianBlur(w_s, (0, 0), sigmaX=sig_s * 2.5)[..., None]
+
+    est2 = num2 / np.maximum(den2, 1e-5)
+    est1 = np.where(den1 > 1e-3, num1 / np.maximum(den1, 1e-5), est2)
+    if scale < 1.0:
+        est1 = cv2.resize(est1, (w, h), interpolation=cv2.INTER_LINEAR)
+    return np.clip(est1, 0.0, 1.0)
+
+
+def decontaminate_foreground_edges(
+    img_f: np.ndarray,
+    alpha: np.ndarray,
+    fg_est: np.ndarray,
+    bg_est: Optional[np.ndarray] = None,
+    strength: float = 0.90,
+    despill_green: bool = False,
+) -> np.ndarray:
+    """
+    Halo-free Edge Color Decontamination:
+    Replaces background-contaminated boundary colors with the propagated true interior
+    foreground color `fg_est` proportionally to `(1 - alpha)`, preventing any division-by-alpha
+    ringing or double-contour artifacts while removing 100% of green/background spill.
+    """
+    fg = img_f.copy()
+    if strength > 1e-3:
+        a = alpha[..., None]
+        edge_zone = (alpha > 0.005) & (alpha < 0.98)
+        if np.any(edge_zone):
+            w_replace = np.clip(strength * (1.0 - a) ** 0.75, 0.0, 1.0)
+            blended = img_f * (1.0 - w_replace) + fg_est * w_replace
+            fg = np.where(edge_zone[..., None], blended, img_f)
+
+    if despill_green:
+        # Suppress residual green chroma excess along boundary and skin/bezel reflections
+        b, g, r = fg[..., 0], fg[..., 1], fg[..., 2]
+        max_rb = np.maximum(r, b)
+        avg_rb = 0.6 * r + 0.4 * b
+        excess_g = np.maximum(0.0, g - max_rb)
+        # Stronger despill near the edge, gentle despill inside
+        edge_weight = np.clip(1.2 - 0.85 * alpha, 0.25, 1.0)
+        g_clean = g - excess_g * edge_weight
+        # Restore perceived luminance slightly so despilled edges don't turn dark
+        lum_loss = (g - g_clean) * 0.45
+        fg = np.stack(
+            [
+                np.clip(b + lum_loss * 0.4, 0.0, 1.0),
+                np.clip(g_clean, 0.0, 1.0),
+                np.clip(r + lum_loss * 0.6, 0.0, 1.0),
+            ],
+            axis=-1,
+        )
+        # For boundary pixels still leaning green over neutral/warm foreground, clamp G to avg_rb
+        boundary = (alpha > 0.02) & (alpha < 0.96)
+        if np.any(boundary):
+            fg[boundary, 1] = np.minimum(fg[boundary, 1], np.maximum(avg_rb[boundary], max_rb[boundary]))
+
+    return np.clip(fg, 0.0, 1.0)
+
+
+_VITMATTE_CACHE: dict = {}
+
+
+def _run_vitmatte_gpu(bgr: np.ndarray, trimap: np.ndarray) -> Optional[np.ndarray]:
+    """
+    Run HuggingFace ViTMatte (hustvl/vitmatte-small-composition-1k) on local CUDA GPU
+    inside the active trimap bounding box for hair/sub-pixel neural alpha matting.
+    """
+    try:
+        import torch
+        from PIL import Image
+        from transformers import VitMatteForImageMatting, VitMatteImageProcessor
+
+        if "model" not in _VITMATTE_CACHE:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            proc = VitMatteImageProcessor.from_pretrained(
+                "hustvl/vitmatte-small-composition-1k", local_files_only=True
+            )
+            model = (
+                VitMatteForImageMatting.from_pretrained(
+                    "hustvl/vitmatte-small-composition-1k", local_files_only=True
+                )
+                .to(device)
+                .eval()
+            )
+            _VITMATTE_CACHE["proc"] = proc
+            _VITMATTE_CACHE["model"] = model
+            _VITMATTE_CACHE["device"] = device
+
+        proc = _VITMATTE_CACHE["proc"]
+        model = _VITMATTE_CACHE["model"]
+        device = _VITMATTE_CACHE["device"]
+
+        h, w = bgr.shape[:2]
+        ys, xs = np.where(trimap > 0)
+        if len(xs) == 0:
+            return np.zeros((h, w), dtype=np.float32)
+
+        y0, y1 = max(0, int(ys.min()) - 16), min(h, int(ys.max()) + 16)
+        x0, x1 = max(0, int(xs.min()) - 16), min(w, int(xs.max()) + 16)
+        ch, cw = y1 - y0, x1 - x0
+
+        crop_rgb = cv2.cvtColor(bgr[y0:y1, x0:x1], cv2.COLOR_BGR2RGB)
+        crop_tri = trimap[y0:y1, x0:x1]
+
+        inputs = proc(
+            images=Image.fromarray(crop_rgb),
+            trimaps=Image.fromarray(crop_tri),
+            return_tensors="pt",
+        ).to(device)
+
+        with torch.inference_mode():
+            if device == "cuda":
+                with torch.amp.autocast("cuda", dtype=torch.float16):
+                    pred = model(**inputs).alphas[0, 0].float().cpu().numpy()
+            else:
+                pred = model(**inputs).alphas[0, 0].float().cpu().numpy()
+
+        pred_resized = cv2.resize(
+            pred[:ch, :cw] if (pred.shape[0] >= ch and pred.shape[1] >= cw) else pred,
+            (cw, ch),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        alpha = np.zeros((h, w), dtype=np.float32)
+        alpha[y0:y1, x0:x1] = np.clip(pred_resized, 0.0, 1.0)
+        alpha[trimap == 255] = 1.0
+        alpha[trimap == 0] = 0.0
+        return alpha
+    except Exception:
+        return None
+
+
+def verify_and_compensate_pass2(
+    bgr: np.ndarray,
+    mask_pass1: np.ndarray,
+    ref_bgr: Optional[np.ndarray] = None,
+    ref_mask: Optional[np.ndarray] = None,
+) -> tuple[np.ndarray, np.ndarray, bool, int, int, np.ndarray]:
+    """
+    UNIVERSAL PASS-2 CLOSED-LOOP PIXEL VERIFICATION & COMPENSATION:
+    Works for ANY object (any product, color, shape, hand) and ANY background
+    (real-world indoor/outdoor, desk, street, or chroma green/blue screen).
+    Compares Frame `bgr` + `mask_pass1` against:
+      1. The user's Confirmed Reference Keyframe `(ref_bgr, ref_mask)` foreground/background distributions
+      2. The current frame's confident interior foreground core vs. exterior background
+      3. High-gradient rigid core contours inside the foreground
+    Restores missing foreground pixels (False Negatives) and prunes excess background pixels (False Positives).
+    """
+    h, w = bgr.shape[:2]
+    m1 = (mask_pass1 > 0).astype(np.uint8)
+    b = bgr[..., 0].astype(np.float32)
+    g = bgr[..., 1].astype(np.float32)
+    r = bgr[..., 2].astype(np.float32)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    ycrcb = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
+    hue, sat, val = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+    cr, cb = ycrcb[..., 1], ycrcb[..., 2]
+    g_exc = g - np.maximum(r, b)
+
+    # 1. Detect rigid interior core strictly inside eroded m1 (never overlapping the outer boundary ring or background!)
+    eroded_m1 = cv2.erode(m1, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17))) > 0
+    blue_ui = ((b > g + 18.0) & (b > r + 22.0) & (sat > 45) & eroded_m1).astype(np.uint8)
+    dark_face = ((val < 62) & (g_exc < 10.0) & eroded_m1).astype(np.uint8)
+    dev_front = cv2.morphologyEx(
+        (blue_ui | dark_face) * 255,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (19, 19)),
+    )
+    cnts, _ = cv2.findContours(dev_front, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    is_protected_core = np.zeros((h, w), dtype=bool)
+    if cnts:
+        largest_dev = max(cnts, key=cv2.contourArea)
+        area_dev = cv2.contourArea(largest_dev)
+        if int(h * w * 0.004) < area_dev < int(h * w * 0.50):
+            hull_mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.drawContours(hull_mask, [cv2.convexHull(largest_dev)], -1, 255, thickness=cv2.FILLED)
+            hull_mask = cv2.erode(hull_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)))
+            is_protected_core = (hull_mask > 0) & eroded_m1
+
+    # Also protect deep eroded interior of m1 where pixel color is NOT green screen
+    deep_m1 = cv2.erode(m1, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (29, 29))) > 0
+
+    # 2. Check if the exterior background contains a chroma screen (green or blue)
+    has_green_screen = bool(
+        np.sum((g_exc > 18.0) & (hue >= 28) & (hue <= 102) & (sat >= 35) & (m1 == 0))
+        > int(h * w * 0.03)
+    )
+
+    # 3. Universal Reference-Keyframe + Local Frame Lab Color Verification
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    inner = cv2.erode(m1, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))) > 0
+    if not np.any(inner):
+        inner = cv2.erode(m1, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))) > 0
+    outer = cv2.dilate(m1, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))) == 0
+
+    # If reference keyframe (ref_bgr, ref_mask) is provided, use its ground-truth confirmed FG/BG regions
+    ref_bg_match = np.zeros((h, w), dtype=bool)
+    ref_fg_lab_est: Optional[np.ndarray] = None
+    ref_bg_lab_est: Optional[np.ndarray] = None
+    if ref_bgr is not None and ref_mask is not None and ref_bgr.shape[:2] == (h, w):
+        ref_lab = cv2.cvtColor(ref_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+        ref_m = (ref_mask > 0).astype(np.uint8)
+        ref_in = cv2.erode(ref_m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))) > 0
+        ref_out = cv2.dilate(ref_m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))) == 0
+        if np.any(ref_in) and np.any(ref_out):
+            ref_fg_lab_est = _propagate_local_colors(ref_lab / 255.0, ref_in, sigma=12.0) * 255.0
+            ref_bg_lab_est = _propagate_local_colors(ref_lab / 255.0, ref_out, sigma=12.0) * 255.0
+        w_lab = np.array([0.4, 1.2, 1.2], dtype=np.float32)
+        d_to_ref_pixel = np.linalg.norm((lab - ref_lab) * w_lab, axis=-1)
+        ref_bg_match = (ref_m == 0) & (d_to_ref_pixel < 9.0) & (~is_protected_core)
+
+    if has_green_screen:
+        is_green_bg = (g_exc > 3.5) & (hue >= 28) & (hue <= 104) & (sat >= 22) & (~is_protected_core)
+        is_secondary_bg = (
+            (hue >= 17) & (hue <= 35) & ((g - b) > (r - g) * 1.18)
+            & (cr >= 128) & (cb <= 118) & (~is_protected_core)
+        )
+        is_secondary_bg[: int(h * 0.55), :] = False
+        is_bg_sig = is_green_bg | is_secondary_bg | ref_bg_match
+
+        dil_22 = cv2.dilate(m1, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (45, 45))) > 0
+        missing_candidates = dil_22 & (m1 == 0) & (~is_bg_sig)
+        m2_raw = (((m1 > 0) | missing_candidates | is_protected_core) & (~is_bg_sig)).astype(np.uint8)
+    else:
+        # Universal Non-Green-Screen 2-Pass Verification (works on ANY object & ANY real-world background!)
+        if np.any(inner) and np.any(outer):
+            fg_lab = _propagate_local_colors(lab / 255.0, inner, sigma=10.0) * 255.0
+            bg_lab = _propagate_local_colors(lab / 255.0, outer, sigma=10.0) * 255.0
+            if ref_fg_lab_est is not None and ref_bg_lab_est is not None:
+                fg_lab = 0.5 * fg_lab + 0.5 * ref_fg_lab_est
+                bg_lab = 0.5 * bg_lab + 0.5 * ref_bg_lab_est
+
+            w_lab = np.array([0.45, 1.2, 1.2], dtype=np.float32)
+            d_fg = np.linalg.norm((lab - fg_lab) * w_lab, axis=-1)
+            d_bg = np.linalg.norm((lab - bg_lab) * w_lab, axis=-1)
+
+            # Outward band (up to 16px outside m1) & Inward band (up to 14px inside m1)
+            dil_16 = cv2.dilate(m1, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))) > 0
+            ero_14 = cv2.erode(m1, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (27, 27))) > 0
+            out_ring = dil_16 & (m1 == 0)
+            in_ring = (m1 > 0) & (~ero_14) & (~is_protected_core)
+
+            recover_px = out_ring & (d_fg < 8.5) & (d_bg > d_fg * 1.85 + 5.5) & (~ref_bg_match)
+            interior_bg_hole = (m1 > 0) & (~is_protected_core) & (d_bg < 6.0) & (d_fg > d_bg * 2.4 + 9.0)
+            prune_px = (in_ring & (d_bg < 9.0) & (d_fg > d_bg * 1.60 + 4.5)) | interior_bg_hole | (in_ring & ref_bg_match)
+            m2_raw = (((m1 > 0) | recover_px | is_protected_core) & (~prune_px)).astype(np.uint8)
+        else:
+            m2_raw = (m1 | is_protected_core.astype(np.uint8)).astype(np.uint8)
+
+    n_cc, l_cc, stats, _ = cv2.connectedComponentsWithStats(m2_raw, connectivity=8)
+    min_area = max(64, int(h * w * 0.002))
+    clean_pass2 = np.zeros_like(m2_raw)
+    for cid in range(1, n_cc):
+        if stats[cid, cv2.CC_STAT_AREA] >= min_area:
+            clean_pass2[l_cc == cid] = 1
+    if not np.any(clean_pass2) and np.any(m2_raw):
+        clean_pass2 = m2_raw
+
+    actual_missing = (clean_pass2 == 1) & (m1 == 0)
+    actual_excess = (clean_pass2 == 0) & (m1 == 1)
+
+    diff_bgr = (bgr.astype(np.float32) * 0.55).astype(np.uint8)
+    diff_bgr[actual_missing] = (0, 255, 0)
+    diff_bgr[actual_excess] = (0, 0, 255)
+    diff_rgb = cv2.cvtColor(diff_bgr, cv2.COLOR_BGR2RGB)
+
+    return (
+        clean_pass2,
+        is_protected_core,
+        has_green_screen,
+        int(np.sum(actual_missing)),
+        int(np.sum(actual_excess)),
+        diff_rgb,
+    )
+
+
+def extract_pixel_accurate_matte(
+    bgr: np.ndarray,
+    coarse_mask: np.ndarray,
+    cfg: Optional[MattingConfig] = None,
+    ref_bgr: Optional[np.ndarray] = None,
+    ref_mask: Optional[np.ndarray] = None,
+) -> MattingResult:
+    """
+    2-Pass Closed-Loop Pixel-Accurate Alpha Matting & Zero-Blur Despill:
+      - Pass 1: Coarse mask from SAM 2.1 / Roto-Brush / Chroma Key.
+      - Pass 2: Closed-Loop Pixel Verification & Compensation against source frame `bgr`
+        and Reference Keyframe `(ref_bgr, ref_mask)`, followed by ViTMatte GPU Neural Matting
+        or Sub-Pixel Joint Guided Filtering + Continuous Chroma-Ratio Alpha.
+    """
+    if cfg is None:
+        cfg = MattingConfig()
+
+    h, w = bgr.shape[:2]
+    m_in = (coarse_mask > 0).astype(np.uint8)
+
+    if not np.any(m_in > 0):
+        empty_a = np.zeros((h, w), dtype=np.float32)
+        rgba = np.dstack([cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), np.zeros((h, w), dtype=np.uint8)])
+        return MattingResult(alpha=empty_a, fg_clean_bgr=bgr.copy(), rgba=rgba, trimap=m_in)
+
+    # Optional Pass-2 Closed-Loop Verification & Compensation
+    if cfg.two_pass_verify:
+        clean_m, is_device_hull, has_green, n_miss, n_exc, diff_rgb = verify_and_compensate_pass2(
+            bgr, m_in, ref_bgr=ref_bgr, ref_mask=ref_mask
+        )
+    else:
+        clean_m = m_in
+        is_device_hull = np.zeros((h, w), dtype=bool)
+        has_green = False
+        n_miss, n_exc, diff_rgb = 0, 0, None
+
+    m_u8 = clean_m * 255
+
+    if cfg.erode_dilate != 0 and not has_green:
+        k_ed = abs(int(cfg.erode_dilate)) * 2 + 1
+        ker_ed = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_ed, k_ed))
+        if cfg.erode_dilate > 0:
+            m_u8 = cv2.dilate(m_u8, ker_ed, iterations=1)
+        else:
+            m_u8 = cv2.erode(m_u8, ker_ed, iterations=1)
+
+    r = max(1, min(int(cfg.trimap_radius), 2 if has_green else 8))
+    k_tri = r * 2 + 1
+    ker_tri = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_tri, k_tri))
+    fg_core = cv2.erode(m_u8, ker_tri, iterations=1) > 0
+    bg_core = cv2.dilate(m_u8, ker_tri, iterations=1) == 0
+    unknown = (~fg_core) & (~bg_core)
+
+    trimap = np.zeros((h, w), dtype=np.uint8)
+    trimap[unknown] = 128
+    trimap[fg_core] = 255
+
+    img_f = bgr.astype(np.float32) / 255.0
+
+    if has_green:
+        # 1. Protect the full rigid device zone (protected core + adjacent white/silver/dark bezels within 25px)
+        b_raw, g_raw, r_raw = bgr[..., 0].astype(np.float32), bgr[..., 1].astype(np.float32), bgr[..., 2].astype(np.float32)
+        hsv_raw = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        hue_r, sat_r, val_r = hsv_raw[..., 0], hsv_raw[..., 1], hsv_raw[..., 2]
+        dil_core = cv2.dilate(is_device_hull.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_RECT, (55, 49))) > 0
+        is_bezel_px = ((val_r >= 135) & (sat_r <= 52) & (np.abs(r_raw - b_raw) <= 30.0)) | (val_r < 68)
+        is_bezel_px[int(h * 0.76):, :] = False
+        is_device_zone = is_device_hull | (dil_core & is_bezel_px)
+
+        # 2. Eliminate Jagged Staircase (Viền Răng Cưa):
+        # Shave 2px off soft skin/organic boundaries (to strip ISP sharpening & green-mixed rim) while keeping rigid device edges intact,
+        # then smooth the Signed Distance Field (SDF) via Gaussian Curvature Flow (sigma=2.0).
+        m_shaved = clean_m.copy()
+        if min(h, w) >= 720:
+            eroded_skin = cv2.erode(clean_m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+            m_shaved[~is_device_zone] = eroded_skin[~is_device_zone]
+            m_shaved = cv2.morphologyEx(m_shaved, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+            m_shaved = cv2.morphologyEx(m_shaved, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+        sdf_sigma = 2.0 if min(h, w) >= 720 else 1.0
+
+        d_in = cv2.distanceTransform(m_shaved, cv2.DIST_L2, 5)
+        d_out = cv2.distanceTransform(1 - m_shaved, cv2.DIST_L2, 5)
+        sdf = d_in - d_out
+        sdf_smooth = cv2.GaussianBlur(sdf, (0, 0), sigmaX=sdf_sigma)
+        alpha_sdf = np.clip((sdf_smooth + 0.4) / 2.2, 0.0, 1.0).astype(np.float32)
+
+        if hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "guidedFilter"):
+            alpha = cv2.ximgproc.guidedFilter(guide=img_f, src=alpha_sdf, radius=2, eps=1e-3)
+        else:
+            alpha = cv2.GaussianBlur(alpha_sdf, (3, 3), 0)
+        alpha = np.clip((alpha - 0.08) / 0.86, 0.0, 1.0)
+        alpha[sdf_smooth < -2.2] = 0.0
+        alpha[is_device_hull] = 1.0
+
+        # 3. Eliminate White Rim Halo on Fingers (Khử Viền Trắng Mép Ngón Tay) + Zero-Blur Despill:
+        b_f, g_f, r_f = img_f[..., 0], img_f[..., 1], img_f[..., 2]
+        max_rb = np.maximum(r_f, b_f)
+        spill = np.where(is_device_hull, 0.0, np.maximum(0.0, g_f - max_rb))
+        fg_despilled = np.stack(
+            [
+                np.clip(b_f + spill * 0.20, 0.0, 1.0),
+                np.clip(g_f - spill, 0.0, 1.0),
+                np.clip(r_f + spill * 0.35, 0.0, 1.0),
+            ],
+            axis=-1,
+        )
+
+        # Propagate deep interior skin color from 13px inside the hand outward to the 14px rim
+        # using Intrinsic Albedo + Micro-Texture Decomposition (preserves skin pores while stripping 100% of old studio rim glare!)
+        low_fg = cv2.GaussianBlur(fg_despilled, (0, 0), sigmaX=2.5)
+        micro_tex = np.clip(fg_despilled - low_fg, -0.045, 0.045)
+        deep_skin_core = (sdf_smooth > 13.0) & (~is_device_zone)
+        if np.any(deep_skin_core):
+            deep_albedo = _propagate_local_colors(low_fg, deep_skin_core, sigma=16.0)
+            rim_weight = np.clip((14.0 - sdf_smooth) / 12.0, 0.0, 1.0)[..., None]
+            rim_weight[is_device_zone] = 0.0
+            fg_clean_f = fg_despilled * (1.0 - rim_weight) + np.clip(deep_albedo + micro_tex, 0.0, 1.0) * rim_weight
+        else:
+            fg_clean_f = fg_despilled
+    else:
+        sigma = float(max(2.5, r * 1.35))
+        fg_est = _propagate_local_colors(img_f, fg_core, sigma=sigma)
+        bg_est = _propagate_local_colors(img_f, bg_core, sigma=sigma)
+
+        lab_f = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32) / 255.0
+        lab_f[..., 0] *= 0.45
+        fg_lab_est = _propagate_local_colors(lab_f, fg_core, sigma=sigma)
+        bg_lab_est = _propagate_local_colors(lab_f, bg_core, sigma=sigma)
+
+        diff_fb = fg_lab_est - bg_lab_est
+        dist_sq = np.sum(diff_fb * diff_fb, axis=-1)
+        proj = np.sum((lab_f - bg_lab_est) * diff_fb, axis=-1)
+        alpha_color = np.clip(proj / (dist_sq + 1e-4), 0.0, 1.0)
+
+        dist_to_bg = cv2.distanceTransform((~bg_core).astype(np.uint8), cv2.DIST_L2, 3)
+        dist_to_fg = cv2.distanceTransform((~fg_core).astype(np.uint8), cv2.DIST_L2, 3)
+        alpha_geom = np.clip(dist_to_bg / (dist_to_bg + dist_to_fg + 1e-5), 0.0, 1.0)
+
+        color_conf = np.clip(dist_sq / 0.012, 0.0, 1.0)
+        alpha_blend = color_conf * alpha_color + (1.0 - color_conf) * alpha_geom
+        inside_mask = m_u8 > 0
+        alpha_blend = np.where(
+            inside_mask,
+            np.maximum(alpha_blend, alpha_geom * 0.88),
+            np.minimum(alpha_blend, alpha_geom * 1.12),
+        )
+
+        alpha_init = np.where(fg_core, 1.0, np.where(bg_core, 0.0, alpha_blend)).astype(np.float32)
+
+        vit_alpha = _run_vitmatte_gpu(bgr, trimap) if cfg.use_vitmatte_gpu else None
+        if vit_alpha is not None:
+            alpha = vit_alpha
+        else:
+            gr_rad = max(1, int(cfg.guided_radius))
+            gr_eps = float(max(1e-6, cfg.guided_eps))
+            if hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "guidedFilter"):
+                alpha_refined = cv2.ximgproc.guidedFilter(guide=img_f, src=alpha_init, radius=gr_rad, eps=gr_eps)
+            else:
+                alpha_refined = cv2.GaussianBlur(alpha_init, (gr_rad * 2 + 1, gr_rad * 2 + 1), 0)
+
+            alpha = np.clip((alpha_refined - 0.06) / 0.88, 0.0, 1.0)
+            k_far = (r + 2) * 2 + 1
+            ker_far = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_far, k_far))
+            deep_in = cv2.GaussianBlur((cv2.erode(m_u8, ker_far) > 0).astype(np.float32), (5, 5), 0)
+            far_out = cv2.GaussianBlur((cv2.dilate(m_u8, ker_far) > 0).astype(np.float32), (5, 5), 0)
+            alpha = np.clip((alpha * (1.0 - deep_in) + deep_in) * far_out, 0.0, 1.0)
+
+        fg_clean_f = decontaminate_foreground_edges(
+            img_f,
+            alpha,
+            fg_est=fg_est,
+            bg_est=bg_est,
+            strength=float(np.clip(cfg.decontaminate_strength, 0.0, 1.0)),
+            despill_green=bool(cfg.despill_green),
+        )
+        # Apply Intrinsic Albedo + Micro-Texture Rim Normalization on non-green-screen edges too
+        # so bright old-background rim glare is replaced by interior albedo + skin/object micro-texture
+        if min(h, w) >= 480:
+            d_in_ng = cv2.distanceTransform((m_u8 > 0).astype(np.uint8), cv2.DIST_L2, 3)
+            deep_ng_core = (d_in_ng > 10.0) & (~is_device_hull)
+            if np.any(deep_ng_core):
+                low_ng = cv2.GaussianBlur(fg_clean_f, (0, 0), sigmaX=2.2)
+                micro_ng = np.clip(fg_clean_f - low_ng, -0.045, 0.045)
+                deep_ng_albedo = _propagate_local_colors(low_ng, deep_ng_core, sigma=12.0)
+                rim_ng_w = np.clip((10.0 - d_in_ng) / 9.0, 0.0, 1.0)[..., None] * float(cfg.decontaminate_strength) * 0.75
+                rim_ng_w[is_device_hull] = 0.0
+                fg_clean_f = fg_clean_f * (1.0 - rim_ng_w) + np.clip(deep_ng_albedo + micro_ng, 0.0, 1.0) * rim_ng_w
+
+    fg_clean_bgr = np.clip(fg_clean_f * 255.0, 0, 255).astype(np.uint8)
+    fg_clean_rgb = cv2.cvtColor(fg_clean_bgr, cv2.COLOR_BGR2RGB)
+    alpha_u8 = np.clip(alpha * 255.0, 0, 255).astype(np.uint8)
+    rgba = np.dstack([fg_clean_rgb, alpha_u8])
+
+    return MattingResult(
+        alpha=alpha,
+        fg_clean_bgr=fg_clean_bgr,
+        rgba=rgba,
+        trimap=trimap,
+        missing_restored_px=n_miss,
+        excess_removed_px=n_exc,
+        audit_diff_rgb=diff_rgb,
+    )

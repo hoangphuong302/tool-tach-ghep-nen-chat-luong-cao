@@ -1,0 +1,30 @@
+# Python & Virtual Environment
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# Heavy Runtime Workspace, Rendered Frames & Videos
+workspace/
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+# Model Checkpoints (auto-downloaded via download_checkpoints.py)
+checkpoints/*.pt
+checkpoints/*.pth
+checkpoints/*.safetensors
+
+# Environment & Secrets
+.env
+.env.local
+
+# OS & IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
