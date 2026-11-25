@@ -16,6 +16,7 @@ from src.alpha_matting import (
     decontaminate_foreground_edges,
     detect_active_frame_box,
     extract_pixel_accurate_matte,
+    stabilize_alpha_temporal,
 )
 from src.flow_prompt_engine import (
     analyze_scene_telemetry,
@@ -26,6 +27,7 @@ from src.relight_harmonizer import (
     clean_ai_background_ghost,
     composite_with_relighting,
     detect_emissive_screen_mask,
+    verify_and_polish_composite_pass3,
 )
 
 
@@ -212,10 +214,11 @@ def test_full_5_step_ui_handlers_end_to_end() -> None:
     assert "9:16" in tele_md
     assert f0_rgb.shape[0] > 100
 
-    # Step 2: Confirm Roto-Brush selection & sub-pixel alpha matting
-    roto_vis, cutout_vis, png_path, state, msg2 = app.on_step2_confirm_roto_brush(
+    # Step 2: Confirm Roto-Brush selection & sub-pixel alpha matting (returns 6-tuple with emerald green canvas)
+    editor_green, roto_vis, cutout_vis, png_path, state, msg2 = app.on_step2_confirm_roto_brush(
         None, 0, 3, 4, 0.92, False, -1, state
     )
+    assert editor_green.shape == f0_rgb.shape
     assert roto_vis.shape == f0_rgb.shape
     assert cutout_vis.shape == f0_rgb.shape
     assert Path(png_path).exists()
@@ -292,6 +295,56 @@ def test_universal_non_green_screen_pass2_verification() -> None:
     assert res.excess_removed_px >= 800, f"Expected >=800 excess gray desk pixels pruned, got {res.excess_removed_px}"
 
 
+def test_pass3_aa_and_source_restoration() -> None:
+    """Verify Pass-3 tangential anti-aliasing smooths diagonal staircases and restores interior micro-detail + aberrant redness."""
+    h, w = 220, 220
+    yy, xx = np.mgrid[0:h, 0:w]
+    # Diagonal boundary with deliberate jagged quantization step in alpha
+    signed = (xx * 0.7 + yy * 0.7) - 150.0
+    quantized_alpha = np.clip(np.round((signed / 2.2 + 0.5) * 3.0) / 3.0, 0.0, 1.0).astype(np.float32)
+
+    orig_fg_f = np.full((h, w, 3), 0.72, dtype=np.float32)
+    # Add fine micro-texture pores/lines inside interior
+    orig_fg_f[80:200, 80:200] += ((xx[80:200, 80:200] % 3 == 0).astype(np.float32)[..., None] * 0.08)
+    bg_f = np.full((h, w, 3), 0.18, dtype=np.float32)
+
+    # Simulate relit foreground where micro-texture was smoothed out AND one patch drifted bright red
+    fg_f = cv2.GaussianBlur(orig_fg_f, (0, 0), sigmaX=2.2)
+    fg_f[140:175, 140:175] = np.array([0.20, 0.22, 0.90], dtype=np.float32)  # aberrant red patch
+
+    comp_f = bg_f * (1.0 - quantized_alpha[..., None]) + fg_f * quantized_alpha[..., None]
+    out_u8, stats = verify_and_polish_composite_pass3(comp_f, fg_f, orig_fg_f, bg_f, quantized_alpha)
+
+    assert stats["aa_polished_px"] > 100
+    assert stats["detail_restored_px"] > 500
+    assert stats["drift_reverted_px"] >= 900
+    # Redness on the aberrant patch must be reduced sharply
+    out_patch = out_u8[145:170, 145:170].astype(np.float32) / 255.0
+    assert float(np.mean(out_patch[..., 2] - out_patch[..., 1])) < 0.35
+
+
+def test_photogrammetric_smartphone_telemetry_and_temporal_alpha() -> None:
+    """Verify photogrammetric lens estimation (focal_length_mm, smartphone DoF) and temporal alpha smoothing."""
+    bgr = np.full((640, 360, 3), (40, 180, 45), dtype=np.uint8)
+    fg_mask = np.zeros((640, 360), dtype=np.uint8)
+    fg_mask[240:600, 80:280] = 1
+    tele = analyze_scene_telemetry(bgr, fg_mask)
+    assert tele["focal_length_mm"] in (24, 26, 28, 35)
+    assert "camera_pitch_deg" in tele and tele["camera_pitch_deg"] < 0
+    assert "smartphone" in tele["bokeh_en"].lower()
+
+    prompts = generate_flow_prompts(tele, "Sảnh sân bay hiện đại", use_local_llm=False)
+    assert f"{tele['focal_length_mm']}mm" in prompts["clean_plate_prompt"]
+
+    # Temporal stabilization smooths stationary boundary flicker while preserving moving edges
+    prev_bgr = np.full((120, 120, 3), 100, dtype=np.uint8)
+    curr_bgr = prev_bgr.copy()  # stationary
+    prev_a = np.full((120, 120), 0.2, dtype=np.float32)
+    curr_a = np.full((120, 120), 0.8, dtype=np.float32)
+    st_a = stabilize_alpha_temporal(curr_a, prev_a, curr_bgr, prev_bgr)
+    assert float(np.mean(st_a)) < 0.65
+
+
 if __name__ == "__main__":
     test_active_frame_detection_on_pillarbox()
     test_subpixel_alpha_matting_and_decontamination()
@@ -301,4 +354,6 @@ if __name__ == "__main__":
     test_two_pass_pixel_verification_and_compensation()
     test_universal_non_green_screen_pass2_verification()
     test_full_5_step_ui_handlers_end_to_end()
+    test_pass3_aa_and_source_restoration()
+    test_photogrammetric_smartphone_telemetry_and_temporal_alpha()
     print("ALL TESTS PASSED!")

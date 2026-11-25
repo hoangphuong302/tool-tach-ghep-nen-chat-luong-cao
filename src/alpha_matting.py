@@ -623,21 +623,29 @@ def verify_and_compensate_pass2(
         ref_m = (ref_mask > 0).astype(np.uint8)
         ref_in = cv2.erode(ref_m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))) > 0
         ref_out = cv2.dilate(ref_m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))) == 0
+        w_lab = np.array([0.4, 1.2, 1.2], dtype=np.float32)
+        d_to_ref_pixel = np.linalg.norm((lab - ref_lab) * w_lab, axis=-1)
+        is_human_skin = (
+            (cr >= 133) & (cr <= 178) & (cb >= 77) & (cb <= 128)
+            & ((hue <= 18) | (hue >= 162))
+        )
         if np.any(ref_in) and np.any(ref_out):
             ref_fg_lab_est = _propagate_local_colors(ref_lab / 255.0, ref_in, sigma=12.0) * 255.0
             ref_bg_lab_est = _propagate_local_colors(ref_lab / 255.0, ref_out, sigma=12.0) * 255.0
-        w_lab = np.array([0.4, 1.2, 1.2], dtype=np.float32)
-        d_to_ref_pixel = np.linalg.norm((lab - ref_lab) * w_lab, axis=-1)
-        ref_bg_match = (ref_m == 0) & (d_to_ref_pixel < 9.0) & (~is_protected_core)
+            d_ref_fg = np.linalg.norm((lab - ref_fg_lab_est) * w_lab, axis=-1)
+            d_ref_bg = np.linalg.norm((lab - ref_bg_lab_est) * w_lab, axis=-1)
+            ref_bg_match = (ref_m == 0) & (d_to_ref_pixel < 9.0) & (d_ref_bg + 4.0 < d_ref_fg) & (~is_human_skin) & (~is_protected_core)
+        else:
+            ref_bg_match = (ref_m == 0) & (d_to_ref_pixel < 9.0) & (~is_human_skin) & (~is_protected_core)
 
     if has_green_screen:
         is_green_bg = (g_exc > 3.5) & (hue >= 28) & (hue <= 104) & (sat >= 22) & (~is_protected_core)
         is_secondary_bg = (
-            (hue >= 17) & (hue <= 35) & ((g - b) > (r - g) * 1.18)
+            (hue >= 19) & (hue <= 36) & (sat >= 42) & ((g - b) > (r - g) * 1.45)
             & (cr >= 128) & (cb <= 118) & (~is_protected_core)
         )
         is_secondary_bg[: int(h * 0.55), :] = False
-        is_bg_sig = is_green_bg | is_secondary_bg | ref_bg_match
+        is_bg_sig = is_green_bg | is_secondary_bg
 
         dil_22 = cv2.dilate(m1, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (45, 45))) > 0
         missing_candidates = dil_22 & (m1 == 0) & (~is_bg_sig)
@@ -764,56 +772,71 @@ def extract_pixel_accurate_matte(
         is_bezel_px[int(h * 0.76):, :] = False
         is_device_zone = is_device_hull | (dil_core & is_bezel_px)
 
-        # 2. Eliminate Jagged Staircase (Viền Răng Cưa):
-        # Shave 2px off soft skin/organic boundaries (to strip ISP sharpening & green-mixed rim) while keeping rigid device edges intact,
-        # then smooth the Signed Distance Field (SDF) via Gaussian Curvature Flow (sigma=2.0).
+        # 2. Full-Resolution Continuous Soft Chroma-Ratio Alpha + Shaved SDF Curvature Smoothing (Zero Staircase)
+        g_soft_exc = g_raw - (0.56 * np.maximum(r_raw, b_raw) + 0.44 * np.minimum(r_raw, b_raw))
+        bg_chroma_ref = max(
+            16.0,
+            float(np.median(g_soft_exc[clean_m == 0])) if np.any(clean_m == 0) else 16.0,
+        )
+        alpha_chroma = 1.0 - np.clip((g_soft_exc - 2.0) / bg_chroma_ref, 0.0, 1.0)
+        alpha_chroma[is_device_zone] = 1.0
+
         m_shaved = clean_m.copy()
         if min(h, w) >= 720:
             eroded_skin = cv2.erode(clean_m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
             m_shaved[~is_device_zone] = eroded_skin[~is_device_zone]
             m_shaved = cv2.morphologyEx(m_shaved, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
             m_shaved = cv2.morphologyEx(m_shaved, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
-        sdf_sigma = 2.0 if min(h, w) >= 720 else 1.0
+        sdf_sigma = 2.2 if min(h, w) >= 720 else 1.0
 
         d_in = cv2.distanceTransform(m_shaved, cv2.DIST_L2, 5)
         d_out = cv2.distanceTransform(1 - m_shaved, cv2.DIST_L2, 5)
         sdf = d_in - d_out
         sdf_smooth = cv2.GaussianBlur(sdf, (0, 0), sigmaX=sdf_sigma)
-        alpha_sdf = np.clip((sdf_smooth + 0.4) / 2.2, 0.0, 1.0).astype(np.float32)
+        alpha_sdf = np.clip((sdf_smooth + 0.45) / 2.1, 0.0, 1.0).astype(np.float32)
+        alpha_init = np.where(
+            is_device_zone,
+            alpha_sdf,
+            np.minimum(alpha_sdf, alpha_chroma * 0.55 + alpha_sdf * 0.45),
+        ).astype(np.float32)
 
-        if hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "guidedFilter"):
-            alpha = cv2.ximgproc.guidedFilter(guide=img_f, src=alpha_sdf, radius=2, eps=1e-3)
-        else:
-            alpha = cv2.GaussianBlur(alpha_sdf, (3, 3), 0)
-        alpha = np.clip((alpha - 0.08) / 0.86, 0.0, 1.0)
-        alpha[sdf_smooth < -2.2] = 0.0
-        alpha[is_device_hull] = 1.0
-
-        # 3. Eliminate White Rim Halo on Fingers (Khử Viền Trắng Mép Ngón Tay) + Zero-Blur Despill:
+        # 3. Neutral Chroma Despill (Zero Red Bleed) + Highlight-Clamped White-Rim De-Glare Inpainting
         b_f, g_f, r_f = img_f[..., 0], img_f[..., 1], img_f[..., 2]
-        max_rb = np.maximum(r_f, b_f)
-        spill = np.where(is_device_hull, 0.0, np.maximum(0.0, g_f - max_rb))
+        limit_g = 0.58 * np.maximum(r_f, b_f) + 0.42 * np.minimum(r_f, b_f)
+        spill = np.where(is_device_hull, 0.0, np.maximum(0.0, g_f - limit_g))
         fg_despilled = np.stack(
             [
-                np.clip(b_f + spill * 0.20, 0.0, 1.0),
+                np.clip(b_f + spill * 0.08, 0.0, 1.0),
                 np.clip(g_f - spill, 0.0, 1.0),
-                np.clip(r_f + spill * 0.35, 0.0, 1.0),
+                np.clip(r_f + spill * 0.10, 0.0, 1.0),
             ],
             axis=-1,
         )
 
-        # Propagate deep interior skin color from 13px inside the hand outward to the 14px rim
-        # using Intrinsic Albedo + Micro-Texture Decomposition (preserves skin pores while stripping 100% of old studio rim glare!)
-        low_fg = cv2.GaussianBlur(fg_despilled, (0, 0), sigmaX=2.5)
-        micro_tex = np.clip(fg_despilled - low_fg, -0.045, 0.045)
-        deep_skin_core = (sdf_smooth > 13.0) & (~is_device_zone)
-        if np.any(deep_skin_core):
-            deep_albedo = _propagate_local_colors(low_fg, deep_skin_core, sigma=16.0)
-            rim_weight = np.clip((14.0 - sdf_smooth) / 12.0, 0.0, 1.0)[..., None]
-            rim_weight[is_device_zone] = 0.0
-            fg_clean_f = fg_despilled * (1.0 - rim_weight) + np.clip(deep_albedo + micro_tex, 0.0, 1.0) * rim_weight
+        # Propagate clean near-interior skin tone (4.5px..10.5px inside) outward onto outer 0..5px rim
+        # and clamp any residual white studio rim glare without reddening or darkening the fingers
+        near_skin_band = (sdf_smooth >= 4.5) & (sdf_smooth <= 10.5) & (~is_device_zone)
+        if np.any(near_skin_band):
+            near_albedo = _propagate_local_colors(fg_despilled, near_skin_band, sigma=7.0)
+            rim_w = np.clip((5.0 - sdf_smooth) / 5.0, 0.0, 1.0)[..., None]
+            rim_w[is_device_zone] = 0.0
+            fg_rim_clean = np.minimum(fg_despilled, near_albedo + 0.02) * 0.65 + near_albedo * 0.35
+            fg_clean_f = fg_despilled * (1.0 - rim_w) + fg_rim_clean * rim_w
         else:
             fg_clean_f = fg_despilled
+
+        # 4. Full-Resolution Guided Filter on cleaned foreground + Sub-Pixel Anti-Aliasing
+        gf_rad = 3 if min(h, w) >= 720 else 2
+        if hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "guidedFilter"):
+            alpha = cv2.ximgproc.guidedFilter(guide=fg_clean_f, src=alpha_init, radius=gf_rad, eps=5e-4)
+        else:
+            alpha = cv2.GaussianBlur(alpha_init, (gf_rad * 2 + 1, gf_rad * 2 + 1), 0)
+        alpha = np.clip((alpha - 0.08) / 0.88, 0.0, 1.0)
+        edge_aa_band = (alpha > 0.005) & (alpha < 0.995)
+        alpha_aa = cv2.GaussianBlur(alpha, (0, 0), sigmaX=0.85)
+        alpha = np.where(edge_aa_band, alpha_aa, alpha).astype(np.float32)
+        alpha[sdf_smooth < -2.2] = 0.0
+        alpha[is_device_hull] = 1.0
     else:
         sigma = float(max(2.5, r * 1.35))
         fg_est = _propagate_local_colors(img_f, fg_core, sigma=sigma)
@@ -897,3 +920,33 @@ def extract_pixel_accurate_matte(
         excess_removed_px=n_exc,
         audit_diff_rgb=diff_rgb,
     )
+
+
+def stabilize_alpha_temporal(
+    curr_alpha: np.ndarray,
+    prev_alpha: Optional[np.ndarray],
+    curr_bgr: np.ndarray,
+    prev_bgr: Optional[np.ndarray],
+    motion_thresh: float = 14.0,
+    temporal_weight: float = 0.45,
+) -> np.ndarray:
+    """
+    Motion-adaptive temporal alpha smoothing across boundary pixels to eliminate
+    frame-to-frame edge flicker ('nhap nhay') without ghosting fast finger motion.
+    """
+    if prev_alpha is None or prev_bgr is None:
+        return curr_alpha
+
+    curr_f = curr_alpha.astype(np.float32)
+    prev_f = prev_alpha.astype(np.float32)
+
+    gray_c = cv2.cvtColor(curr_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    gray_p = cv2.cvtColor(prev_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    diff = np.abs(gray_c - gray_p)
+
+    # Low motion -> blend toward prev_alpha to suppress flicker; high motion -> trust curr_alpha
+    still_conf = 1.0 - np.clip((diff - 4.0) / max(motion_thresh, 1.0), 0.0, 1.0)
+    edge_band = ((curr_f > 0.01) & (curr_f < 0.99)) | ((prev_f > 0.01) & (prev_f < 0.99))
+    w = still_conf * float(np.clip(temporal_weight, 0.0, 0.85))
+    blended = curr_f * (1.0 - w) + prev_f * w
+    return np.where(edge_band, blended, curr_f).astype(np.float32)

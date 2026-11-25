@@ -43,22 +43,20 @@ def _fill_mask_holes(mask: np.ndarray, max_hole_ratio: float = 0.0012) -> np.nda
 
 
 def temporal_smooth_mask(mask_paths: List[Path], t: int, radius: int = 2, sigma: float = 1.2) -> np.ndarray:
-    """Remove per-frame SAM boundary flicker: fast 0.5x Gaussian-weighted mask average
-    over frames t-radius..t+radius (symmetric window => no temporal lag). Full-res binary out."""
+    """Remove per-frame SAM boundary flicker at FULL native resolution:
+    Gaussian-weighted mask average over frames t-radius..t+radius followed by sub-pixel anti-alias blur."""
     from src.video_io import load_mask
 
     lo, hi = max(0, t - radius), min(len(mask_paths) - 1, t + radius)
-    acc, wsum, shape = None, 0.0, None
+    acc, wsum = None, 0.0
     for i in range(lo, hi + 1):
-        m = load_mask(mask_paths[i])
-        shape = m.shape
-        sw, sh = max(32, shape[1] // 2), max(32, shape[0] // 2)
-        s = cv2.resize(m.astype(np.float32), (sw, sh), interpolation=cv2.INTER_LINEAR)
+        m = load_mask(mask_paths[i]).astype(np.float32)
         wgt = float(np.exp(-0.5 * ((i - t) / sigma) ** 2))
-        acc = s * wgt if acc is None else acc + s * wgt
+        acc = m * wgt if acc is None else acc + m * wgt
         wsum += wgt
-    up = cv2.resize(acc / max(wsum, 1e-6), (shape[1], shape[0]), interpolation=cv2.INTER_LINEAR)
-    return (up > 0.5).astype(np.uint8)
+    avg = acc / max(wsum, 1e-6)
+    avg_aa = cv2.GaussianBlur(avg, (0, 0), sigmaX=0.75)
+    return (avg_aa > 0.5).astype(np.uint8)
 
 
 def clear_vram() -> None:

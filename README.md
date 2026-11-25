@@ -1,28 +1,26 @@
 # Tool Tách Ghép Nền Chất Lượng Cao — AGY 3D Roto-Brush & Google Flow Studio
 
-Ứng dụng chạy **100% Offline trên GPU máy cá nhân** giúp tách chủ thể (bàn tay cầm sản phẩm, thiết bị điện tử, vật thể bất kỳ trên phông xanh hoặc phông nền đời thực) ở cấp độ **Sub-Pixel**, tự động **Kiểm Định & Bù Đắp Pixel 2 Vòng**, **Đổ Bóng Khối Vòm 3D Mép Viền** khớp ánh sáng nền mới, **Khóa Chuyển Động Camera** và tự động viết **Prompt Google Flow** giữ nguyên góc máy/ống kính gốc.
+Ứng dụng chạy **100% Offline trên GPU máy cá nhân ở độ phân giải gốc (không giảm scale)** giúp tách chủ thể (bàn tay cầm sản phẩm, thiết bị điện tử, vật thể bất kỳ trên phông xanh hoặc phông nền đời thực) ở cấp độ **Sub-Pixel**, tự động **Kiểm Định & Bù Đắp Pixel 3 Vòng (Pass-1 ➔ Pass-2 ➔ Pass-3 Khử Răng Cưa Tiếp Tuyến & Khôi Phục Pixel Gốc)**, **Khớp Ánh Sáng Trung Tính Mép Viền** không ám đỏ/viền trắng, **Khóa Chuyển Động Camera** và tự động **Đo Tiêu Cự Ống Kính (`mm`)** viết **Prompt Google Flow** phong cách điện thoại bình dân chân thực.
 
 ---
 
 ## 1. Tính Năng Cốt Lõi
 
-1. **Tách Chủ Thể Thông Minh Kiểu Roto-Brush (`SAM 2.1` + `Color Edge Snap`)**
-   - Hỗ trợ cả **bôi cọ chọn thủ công** (Cọ Xanh Lá = Giữ lại, Cọ Đỏ = Loại bỏ), **Tự Động Tách Tay + Sản Phẩm 1-Click** và **Tách Phông Xanh 1-Click**.
+1. **Chọn Vùng Thông Minh 1 Nét Kiểu Photoshop (`1-Stroke Object Selection` + `SAM 2.1`)**
+   - Bôi **1 nét Cọ Xanh Lá** lên đối tượng ➔ công cụ tự động nhận diện và phủ xanh lá ngọc lục bảo toàn bộ vật thể cộng dồn (nhiều vật thể chạm nhẹ mỗi thứ 1 nét); dùng **Cọ Đỏ** để trừ vùng thừa, hoặc bấm **Tự Động Tách Tay + Sản Phẩm 1-Click** / **Tách Phông Xanh 1-Click**.
    - Tự động phát hiện và cắt bỏ viền đen 2 bên (ví dụ video dọc `9:16` nằm trong khung `16:9`), đồng thời cắt sẵn 6 ảnh tham chiếu từ video gốc.
-2. **Kiểm Định & Bù Đắp Pixel 2 Vòng (`2-Pass Closed-Loop Pixel Verification`)**
-   - **Vòng 1:** Theo dõi chuỗi khung hình bằng `SAM2VideoPredictor` (`add_new_mask`) kết hợp làm mượt biên theo thời gian.
-   - **Vòng 2:** Đối chiếu từng pixel với khung hình gốc và keyframe tham chiếu để **tự động bù đắp pixel bị thiếu** (rìa sáng ngón tay, cạnh viền sản phẩm) và **cắt bỏ pixel nền bị thừa** (khe hở kẹt giữa các ngón tay, mặt bàn gỗ), hoạt động tổng quát cho mọi vật thể và mọi loại phông nền.
-3. **Tách Biên Mượt SDF & Khử Viền Trắng (`SDF Curvature Smoothing` + `Intrinsic Albedo Rim Decomposition`)**
-   - Làm mượt đường biên bằng Trường Khoảng Cách Có Dấu (SDF) và **Joint Guided Filter**, loại bỏ hoàn toàn hiện tượng răng cưa bậc thang.
-   - Tách riêng vân da/vân vật liệu tần số cao ghép với sắc tố lõi bên trong để bóc sạch viền trắng/viền đèn studio cũ ở mép ngoài.
-   - Tích hợp tùy chọn mô hình mạng nơ-ron **ViTMatte (`hustvl/vitmatte-small-composition-1k`)** và **PyMatting**.
-4. **Ánh Sáng & Đổ Bóng Mép Viền 3D Theo Vector Pháp Tuyến (`3D Surface-Normal Rim Relighting`)**
-   - Tính vector pháp tuyến 3D trên mép viền và lấy mẫu trực tiếp bức xạ ánh sáng nền mới ngay sát bên ngoài viền để tạo độ bo khối 3D và đổ bóng mép viền ăn khớp tự nhiên với bối cảnh mới.
-   - Nén vùng cháy sáng đèn studio và đồng bộ nhiệt độ màu trong không gian **CIE Lab**.
-   - **Bảo vệ màn hình phát sáng (Dual-Zone):** Tự động nhận diện và giữ nguyên 100% độ sắc nét chữ/giao diện trên màn hình thiết bị, chỉ phủ phản quang mặt kính nhẹ.
-5. **Khóa Chuyển Động Camera & Tạo Prompt Google Flow Tự Động**
+2. **Hệ Thống Kiểm Định & Tinh Chỉnh 3 Vòng Khép Kín Ở Độ Phân Giải Gốc (`100% Full-Res 3-Pass`)**
+   - **Vòng 1 (`SAM 2.1 + Temporal Alpha Stabilization`):** Theo dõi chuỗi khung hình bằng `SAM2VideoPredictor` (`add_new_mask`) kết hợp làm mượt biên & ổn định alpha thích ứng chuyển động (`stabilize_alpha_temporal`) khử sạch hiện tượng nhấp nháy giữa các frame.
+   - **Vòng 2 (`Pass-2 Pixel Verification & Neutral White-Rim De-Glare`):** Đối chiếu với khung hình gốc và keyframe tham chiếu để **bù đắp pixel bị thiếu**, **cắt bỏ khe nền thừa**, **khử spill trung tính không ám đỏ lên da tay**, và dùng **Highlight-Clamped Near-Boundary Inpainting** bóc sạch viền trắng đèn studio cũ.
+   - **Vòng 3 (`Pass-3 Post-Composite Audit, Source-Pixel Copy-Back & 5-Tap Tangential AA`):** Quét trực tiếp từng khung hình thành phẩm so với khung hình gốc để khôi phục 100% chi tiết da/chữ màn hình bị sai lệch và chạy khử răng cưa **5-tap dọc tiếp tuyến đường biên + edge bilateral polish** cho mép ngón tay/thiết bị siêu mịn màng.
+3. **Ánh Sáng Mép Viền Tự Nhiên & Bảo Vệ Màn Hình Phát Sáng (`Dual-Zone Relighting`)**
+   - Lấy mẫu bức xạ ánh sáng nền mới theo vector pháp tuyến ngoài đường biên ở độ phân giải gốc kết hợp chuyển màu CIE Lab giới hạn kênh `a` (ngăn da bị đỏ gắt), hòa trộn mép viền tự nhiên.
+   - Tự động nhận diện và giữ nguyên 100% độ sắc nét chữ/giao diện trên màn hình thiết bị, chỉ phủ phản quang mặt kính nhẹ.
+4. **Đo Tiêu Cự Quang Trắc (`mm`) & Tạo Prompt Google Flow Chất Lượng Điện Thoại Chân Thực**
+   - Từ khung hình gốc tự động suy luận tiêu cự ống kính điện thoại (`24mm/26mm/28mm/35mm`), góc nghiêng `pitch/roll`, khoảng cách tay-máy (`cm`) và tương quan tỷ lệ tiền cảnh/hậu cảnh.
+   - Viết Prompt Google Flow (Prompt nền sạch & Prompt Omni 1.2 V2V) mô phỏng **chất lượng quay từ điện thoại bình dân** (chỉ mờ nhòe rất nhẹ ở hậu cảnh xa + nhiễu cảm biến tự nhiên, không xóa phông giả DSLR `f/1.8` gây lộ viền ghép).
+5. **Khóa Chuyển Động Camera**
    - Đo rung/lắc/nghiêng máy quay của nền video gốc bằng Optical Flow RANSAC và áp vào video nền mới để chủ thể và hậu cảnh khóa chặt thành một khối.
-   - Phân tích góc máy POV, độ xóa phông Bokeh và nhiệt độ màu để tự động viết 2 bộ Prompt chuẩn **Google Flow** (Prompt tạo nền sạch & Prompt Omni 1.2 V2V).
 
 ---
 
@@ -107,16 +105,16 @@ tool-tach-ghep-nen-chat-luong-cao/
 ├── requirements.txt              # Danh sách thư viện Python cần thiết
 ├── run.bat                       # Script khởi động nhanh trên Windows
 ├── src/
-│   ├── alpha_matting.py          # Kiểm định 2 vòng, SDF smoothing, khử viền trắng & ViTMatte
-│   ├── relight_harmonizer.py     # Khớp sáng Lab, Đổ bóng 3D theo Vector Pháp Tuyến & Bảo vệ màn hình
-│   ├── segmentation.py           # Roto-Brush SAM 2.1, Multi-cluster & Color Edge Snap
+│   ├── alpha_matting.py          # Pass-2 bù đắp pixel, SDF smoothing, khử viền trắng & ổn định alpha
+│   ├── relight_harmonizer.py     # Khớp sáng Lab, Edge wrap & Pass-3 khử răng cưa tiếp tuyến + copy pixel gốc
+│   ├── segmentation.py           # Roto-Brush SAM 2.1, Multi-cluster, Color Edge Snap & Full-res Temporal Smooth
 │   ├── spatial_align.py          # Đo & khóa chuyển động Camera nền (Optical Flow RANSAC)
-│   ├── flow_prompt_engine.py     # Phân tích quang học & tạo Prompt Google Flow
+│   ├── flow_prompt_engine.py     # Đo tiêu cự quang trắc (mm) & tạo Prompt Google Flow điện thoại thật
 │   ├── temporal_sync.py          # Đồng bộ thời gian (Auto DTW / Manual / 1:1)
 │   ├── compositor.py             # Compositing 3 lớp truyền thống
 │   └── video_io.py               # Đọc/xuất frame & đóng gói MP4 H.264 CRF 16
 └── tests/
-    ├── test_matting_relight_prompt.py  # Bộ 8 test định lượng & tích hợp End-to-End
+    ├── test_matting_relight_prompt.py  # Bộ 10 test định lượng & tích hợp End-to-End
     ├── test_alignment.py               # Test căn khớp không gian
     └── smoke_test.py                   # Smoke test tổng thể
 ```

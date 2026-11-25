@@ -16,6 +16,7 @@ from src.alpha_matting import (
     extract_pixel_accurate_matte,
     extract_strokes_from_editor,
     sample_roto_anchor_points,
+    stabilize_alpha_temporal,
 )
 from src.flow_prompt_engine import analyze_scene_telemetry, generate_flow_prompts
 from src.relight_harmonizer import (
@@ -71,6 +72,19 @@ def _make_checkerboard_cutout(fg_bgr: np.ndarray, alpha: np.ndarray) -> np.ndarr
     a3 = np.clip(alpha, 0.0, 1.0)[..., None]
     comp_bgr = np.clip(bg * (1.0 - a3) + fg_bgr.astype(np.float32) * a3, 0, 255).astype(np.uint8)
     return cv2.cvtColor(comp_bgr, cv2.COLOR_BGR2RGB)
+
+
+def _render_photoshop_green_selection(rgb: np.ndarray, mask: Optional[np.ndarray]) -> np.ndarray:
+    """Photoshop-style cumulative emerald-green overlay + crisp outline directly on the editor canvas."""
+    if mask is None or not np.any(mask > 0):
+        return rgb
+    out = rgb.copy()
+    m = mask > 0
+    green_tint = np.array([0, 235, 90], dtype=np.float32)
+    out[m] = np.clip(out[m].astype(np.float32) * 0.65 + green_tint * 0.35, 0, 255).astype(np.uint8)
+    contours, _ = cv2.findContours(m.astype(np.uint8) * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(out, contours, -1, (0, 255, 110), 2)
+    return out
 
 
 def _draw_roto_confirm_overlay(
@@ -189,6 +203,7 @@ def on_step1_load_source(src_file: Optional[str], auto_crop_bars: bool, state: d
         "height": h,
         "telemetry": telemetry,
         "confirmed_masks": {},      # frame_idx -> mask path
+        "active_mask_by_frame": {}, # frame_idx -> cumulative binary np.ndarray mask (Photoshop 1-stroke)
         "roto_strokes": {},         # frame_idx -> (fg_stroke, bg_stroke)
         "tracked_masks": None,      # list of all per-frame mask paths
         "alpha_mattes_dir": None,
@@ -200,8 +215,9 @@ def on_step1_load_source(src_file: Optional[str], auto_crop_bars: bool, state: d
     telemetry_md = (
         f"**Thông số Video/Ảnh gốc đã phân tích:**\n"
         f"- **Số khung hình:** `{n_frames} frames` @ `{fps:.1f} FPS` | **Kích thước khung thật:** `{w}x{h}` (`{telemetry['active_aspect_ratio']}`){crop_note}\n"
+        f"- **Tiêu cự & Tỷ lệ phối cảnh:** `{telemetry['focal_length_mm']}mm` (~`{telemetry['subject_distance_cm']}cm`) — {telemetry['scale_calibration_vi']}\n"
         f"- **Góc máy & Bố cục:** {telemetry['camera_angle_vi']}\n"
-        f"- **Ống kính & Độ xóa phông (Bokeh):** {telemetry['bokeh_blur_level']}\n"
+        f"- **Quang học Điện thoại:** {telemetry['bokeh_blur_level']}\n"
         f"- **Ánh sáng & Nhiệt độ màu gốc:** {telemetry['lighting_direction']} | {telemetry['color_temperature']}"
     )
 
@@ -212,7 +228,7 @@ def on_step1_load_source(src_file: Optional[str], auto_crop_bars: bool, state: d
         telemetry_md,
         gr.Slider(minimum=0, maximum=max(1, n_frames - 1), step=1, value=0),
         f0_rgb,
-        f"Bước 1 hoàn tất: Đã trích xuất {n_frames} frames và cắt {len(ref_indices)} ảnh tham chiếu. Hãy dùng cọ xanh bôi lên vùng cần tách ở Bước 2!",
+        f"Bước 1 hoàn tất: Đã trích xuất {n_frames} frames và cắt {len(ref_indices)} ảnh tham chiếu. Bôi 1 nét xanh lên máy/tay để tự động chọn toàn bộ vật thể!",
     )
 
 
@@ -223,7 +239,8 @@ def on_select_ref_gallery(state: dict, evt: gr.SelectData):
     sel = int(evt.index) if evt.index is not None else 0
     f_idx = ref_indices[min(sel, len(ref_indices) - 1)]
     rgb = _load_rgb(state["src_frames"][f_idx])
-    return f_idx, rgb
+    active_m = state.get("active_mask_by_frame", {}).get(int(f_idx))
+    return f_idx, _render_photoshop_green_selection(rgb, active_m)
 
 
 def on_frame_slider_change(frame_idx: int, state: dict):
@@ -231,12 +248,53 @@ def on_frame_slider_change(frame_idx: int, state: dict):
     if not frames:
         return None
     f_idx = int(np.clip(frame_idx, 0, len(frames) - 1))
-    return _load_rgb(frames[f_idx])
+    rgb = _load_rgb(frames[f_idx])
+    active_m = state.get("active_mask_by_frame", {}).get(int(f_idx))
+    return _render_photoshop_green_selection(rgb, active_m)
 
 
 # =====================================================================
 # BƯỚC 2: CÔNG CỤ BÔI CHỌN ROTO-BRUSH & CONFIRM VÙNG CHỌN THÔNG MINH
 # =====================================================================
+def apply_photoshop_stroke_to_mask(
+    rgb: np.ndarray,
+    prev_mask: Optional[np.ndarray],
+    fg_stroke: np.ndarray,
+    bg_stroke: np.ndarray,
+) -> np.ndarray:
+    """
+    Photoshop Object Selection 1-Stroke Cumulative Logic:
+      - Green stroke (`fg_stroke`): auto-detect the entire clicked/stroked object and UNION into `prev_mask`.
+      - Red stroke (`bg_stroke`): auto-detect the unwanted region and SUBTRACT from `prev_mask`.
+    """
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    has_fg = bool(np.any(fg_stroke > 0))
+    has_bg = bool(np.any(bg_stroke > 0))
+
+    if has_fg:
+        pts = sample_roto_anchor_points(fg_stroke, bg_stroke, bgr, grid_step=28)
+        seg_m = preview_single_frame_mask(rgb, pts) if any(p[2] == 1 for p in pts) else np.zeros(rgb.shape[:2], dtype=np.uint8)
+        if prev_mask is not None and np.any(prev_mask > 0):
+            mask = ((prev_mask > 0) | (seg_m > 0)).astype(np.uint8)
+        else:
+            mask = (seg_m > 0).astype(np.uint8)
+        if has_bg:
+            rm_dil = cv2.dilate((bg_stroke > 0).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+            mask[rm_dil > 0] = 0
+        return mask
+
+    if has_bg and prev_mask is not None and np.any(prev_mask > 0):
+        # Segment the clicked unwanted part (passing deep core anchors as negatives if distant from stroke)
+        empty = np.zeros_like(fg_stroke)
+        rm_pts = sample_roto_anchor_points(bg_stroke, empty, bgr, grid_step=24)
+        rm_mask = preview_single_frame_mask(rgb, rm_pts) if rm_pts else np.zeros_like(fg_stroke)
+        rm_dil = cv2.dilate((bg_stroke > 0).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+        mask = ((prev_mask > 0) & (rm_mask == 0) & (rm_dil == 0)).astype(np.uint8)
+        return mask
+
+    return prev_mask.astype(np.uint8) if prev_mask is not None else np.zeros(rgb.shape[:2], dtype=np.uint8)
+
+
 def _run_confirm_and_preview(
     f_idx: int,
     bgr: np.ndarray,
@@ -251,15 +309,20 @@ def _run_confirm_and_preview(
     direct_mask: Optional[np.ndarray] = None,
 ):
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    prev_mask = state.get("active_mask_by_frame", {}).get(int(f_idx))
     if direct_mask is not None:
-        mask = direct_mask
+        mask = (direct_mask > 0).astype(np.uint8)
     else:
-        pts = sample_roto_anchor_points(fg_stroke, bg_stroke, bgr, grid_step=32)
-        if not any(p[2] == 1 for p in pts):
-            raise gr.Error("Chưa có nét cọ Xanh Lá (+ Giữ lại). Hãy dùng cọ xanh quét lên thiết bị/bàn tay hoặc bấm 'Quét Roto Tự Động'!")
-        mask = preview_single_frame_mask(rgb, pts)
+        if not np.any(fg_stroke > 0) and not np.any(bg_stroke > 0):
+            if prev_mask is not None and np.any(prev_mask > 0):
+                mask = prev_mask
+            else:
+                raise gr.Error("Chưa có nét cọ Xanh Lá (+ Giữ lại). Hãy bôi 1 nét lên thiết bị/bàn tay hoặc bấm '✨ Tự Động Tách Tay + Sản Phẩm'!")
+        else:
+            mask = apply_photoshop_stroke_to_mask(rgb, prev_mask, fg_stroke, bg_stroke)
 
-    # Save confirmed binary mask for this keyframe
+    # Save confirmed binary mask & cumulative active mask for this keyframe
+    state.setdefault("active_mask_by_frame", {})[int(f_idx)] = (mask > 0).astype(np.uint8)
     work = APP_WORK_DIR
     conf_dir = work / "confirmed_masks"
     conf_dir.mkdir(parents=True, exist_ok=True)
@@ -285,6 +348,7 @@ def _run_confirm_and_preview(
         cv2.cvtColor(mres.rgba, cv2.COLOR_RGBA2BGRA),
     )
 
+    editor_green_rgb = _render_photoshop_green_selection(rgb, mask)
     roto_vis = _draw_roto_confirm_overlay(bgr, mask, fg_stroke, bg_stroke)
     cutout_vis = _make_checkerboard_cutout(mres.fg_clean_bgr, mres.alpha)
 
@@ -293,10 +357,50 @@ def _run_confirm_and_preview(
 
     n_conf = len(state["confirmed_masks"])
     msg = (
-        f"Đã Confirm vùng chọn Roto-Brush tại Frame #{f_idx} (Tổng {n_conf} keyframe) | "
-        f"[Vòng 2 Kiểm Định Pixel]: Đã bù đắp +{mres.missing_restored_px} px bị thiếu & cắt bỏ -{mres.excess_removed_px} px bị thừa!"
+        f"Đã tự động phủ xanh toàn bộ vật thể tại Frame #{f_idx} (Tổng {n_conf} keyframe) | "
+        f"[Vòng 2 Kiểm Định Pixel]: Bù đắp +{mres.missing_restored_px} px & cắt bỏ -{mres.excess_removed_px} px thừa!"
     )
-    return roto_vis, cutout_vis, str(cutout_png_path), state, msg
+    return editor_green_rgb, roto_vis, cutout_vis, str(cutout_png_path), state, msg
+
+
+def on_step2_quick_stroke(
+    editor_val: Optional[dict],
+    frame_idx: int,
+    trimap_radius: int,
+    guided_radius: int,
+    decont_strength: float,
+    despill_green: bool,
+    erode_dilate: int,
+    state: dict,
+):
+    """Photoshop 1-Stroke Auto-Fill trigger on `roto_editor.input` / `apply`: fills object green immediately."""
+    if not state.get("src_frames") or not editor_val:
+        return gr.update(), gr.update(), gr.update(), gr.update(), state, gr.update()
+    f_idx = int(np.clip(frame_idx, 0, len(state["src_frames"]) - 1))
+    bgr = _load_bgr(state["src_frames"][f_idx])
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    prev_mask = state.get("active_mask_by_frame", {}).get(f_idx)
+    base_rgb = _render_photoshop_green_selection(rgb, prev_mask)
+
+    fg_stroke, bg_stroke = extract_strokes_from_editor(editor_val, base_rgb)
+    if not np.any(fg_stroke > 0) and not np.any(bg_stroke > 0):
+        return gr.update(), gr.update(), gr.update(), gr.update(), state, gr.update()
+
+    return _run_confirm_and_preview(
+        f_idx, bgr, fg_stroke, bg_stroke,
+        trimap_radius, guided_radius, decont_strength, despill_green, erode_dilate, state,
+    )
+
+
+def on_step2_reset_selection(frame_idx: int, state: dict):
+    """Clear Photoshop emerald-green cumulative selection on current frame."""
+    if not state.get("src_frames"):
+        return None, None, None, None, state, "Chưa có video/ảnh gốc."
+    f_idx = int(np.clip(frame_idx, 0, len(state["src_frames"]) - 1))
+    state.get("active_mask_by_frame", {}).pop(f_idx, None)
+    state.get("confirmed_masks", {}).pop(f_idx, None)
+    rgb = _load_rgb(state["src_frames"][f_idx])
+    return rgb, rgb, None, None, state, f"Đã xóa vùng chọn tại Frame #{f_idx}. Hãy bôi 1 nét cọ xanh mới!"
 
 
 def on_step2_confirm_roto_brush(
@@ -314,9 +418,11 @@ def on_step2_confirm_roto_brush(
     f_idx = int(np.clip(frame_idx, 0, len(state["src_frames"]) - 1))
     bgr = _load_bgr(state["src_frames"][f_idx])
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    prev_mask = state.get("active_mask_by_frame", {}).get(f_idx)
+    base_rgb = _render_photoshop_green_selection(rgb, prev_mask)
 
-    fg_stroke, bg_stroke = extract_strokes_from_editor(editor_val, rgb)
-    if not np.any(fg_stroke > 0):
+    fg_stroke, bg_stroke = extract_strokes_from_editor(editor_val, base_rgb)
+    if not np.any(fg_stroke > 0) and not np.any(bg_stroke > 0) and prev_mask is None:
         # If user didn't paint a stroke yet, fall back to smart auto-roto strokes so button works immediately
         fg_stroke, bg_stroke = auto_seed_roto_strokes(bgr)
 
@@ -421,12 +527,17 @@ def on_step3_track_and_matte_all_frames(
     )
 
     mask_paths = [Path(p) for p in state["tracked_masks"]]
+    prev_alpha_st = None
+    prev_bgr_st = None
     for t in range(n_frames):
         progress(0.55 + 0.35 * (t / max(n_frames, 1)), desc=f"Tách Sub-Pixel Alpha Matting & Khử viền frame {t + 1}/{n_frames}...")
         bgr = _load_bgr(src_frames[t])
         m_smooth = temporal_smooth_mask(mask_paths, t) if n_frames > 3 else load_mask(mask_paths[t])
         mres = extract_pixel_accurate_matte(bgr, m_smooth, mcfg)
-        checker_rgb = _make_checkerboard_cutout(mres.fg_clean_bgr, mres.alpha)
+        alpha_st = stabilize_alpha_temporal(mres.alpha, prev_alpha_st, bgr, prev_bgr_st)
+        prev_alpha_st = alpha_st
+        prev_bgr_st = bgr
+        checker_rgb = _make_checkerboard_cutout(mres.fg_clean_bgr, alpha_st)
         cv2.imwrite(str(cutout_frames_dir / f"{t:05d}.png"), cv2.cvtColor(checker_rgb, cv2.COLOR_RGB2BGR))
 
     if n_frames > 1:
@@ -704,11 +815,16 @@ def on_step5_render_final_video(
 
     total_restored = 0
     total_removed = 0
+    prev_alpha_stable = None
+    prev_src_bgr = None
     for t in range(n_src):
         progress(0.42 + 0.48 * (t / max(n_src, 1)), desc=f"Vòng 1 + Vòng 2 Kiểm Định Pixel & Ghép Khớp Sáng frame {t + 1}/{n_src}...")
         src_bgr = _load_bgr(src_frames[t])
         m_fg = temporal_smooth_mask(mask_paths, t) if n_src > 3 else load_mask(mask_paths[t])
         mres = extract_pixel_accurate_matte(src_bgr, m_fg, mcfg, ref_bgr=ref_bgr_kf, ref_mask=ref_mask_kf)
+        alpha_stable = stabilize_alpha_temporal(mres.alpha, prev_alpha_stable, src_bgr, prev_src_bgr)
+        prev_alpha_stable = alpha_stable
+        prev_src_bgr = src_bgr
         total_restored += mres.missing_restored_px
         total_removed += mres.excess_removed_px
 
@@ -723,7 +839,7 @@ def on_step5_render_final_video(
 
         comp_bgr = composite_with_relighting(
             fg_clean_bgr=mres.fg_clean_bgr,
-            alpha=mres.alpha,
+            alpha=alpha_stable,
             new_bg_bgr=bg_bgr,
             src_full_bgr=src_bgr,
             cfg=rcfg,
@@ -797,7 +913,7 @@ def build_ui() -> gr.Blocks:
                 with gr.Column(scale=5):
                     frame_slider = gr.Slider(0, 1, step=1, value=0, label="Chọn Khung Hình (Frame Scrubber)")
                     roto_editor = gr.ImageEditor(
-                        label="Bôi Cọ Xanh Lá (Giữ lại) hoặc Cọ Đỏ (Xóa nền) — Hoặc bấm Tự Động Tách bên dưới",
+                        label="Bôi 1 Nét Cọ Xanh (Kiểu Photoshop — Tự nhận & phủ xanh toàn vật thể) hoặc Cọ Đỏ (Xóa vùng thừa)",
                         type="numpy",
                         image_mode="RGB",
                         height=440,
@@ -819,6 +935,11 @@ def build_ui() -> gr.Blocks:
                         )
                         auto_chroma_btn = gr.Button(
                             "🟩 Tách Phông Xanh",
+                            variant="secondary",
+                            elem_classes="compact-btn",
+                        )
+                        reset_roto_btn = gr.Button(
+                            "🔄 Xóa Vùng Chọn",
                             variant="secondary",
                             elem_classes="compact-btn",
                         )
@@ -979,7 +1100,7 @@ def build_ui() -> gr.Blocks:
                         label="Nguồn âm thanh xuất ra",
                     )
                     grain_slider = gr.Slider(0.0, 0.50, value=0.12, step=0.03, label="Khớp hạt nhiễu cảm biến (Grain)")
-                    bg_defocus_slider = gr.Slider(0.0, 15.0, value=2.2, step=0.5, label="Tăng độ mờ Bokeh nền mới (px)")
+                    bg_defocus_slider = gr.Slider(0.0, 15.0, value=0.6, step=0.2, label="Mờ nhẹ hậu cảnh kiểu điện thoại bình dân (px)")
                     clean_ghost_chk = gr.Checkbox(value=False, label="Xóa bóng chủ thể AI ở nền (V2V Ghost Inpaint)")
                     subject_desc_input = gr.Textbox(
                         label="Mô tả chủ thể giữ nguyên (KEEP) cho Prompt",
@@ -1012,22 +1133,34 @@ def build_ui() -> gr.Blocks:
             outputs=[roto_editor],
         )
 
+        roto_editor.input(
+            on_step2_quick_stroke,
+            inputs=[roto_editor, frame_slider, trimap_rad, guided_rad, decont_slider, despill_chk, erode_dilate, state],
+            outputs=[roto_editor, roto_confirm_img, subpixel_cutout_img, cutout_download, state, status_banner],
+        )
+
         confirm_roto_btn.click(
             on_step2_confirm_roto_brush,
             inputs=[roto_editor, frame_slider, trimap_rad, guided_rad, decont_slider, despill_chk, erode_dilate, state],
-            outputs=[roto_confirm_img, subpixel_cutout_img, cutout_download, state, status_banner],
+            outputs=[roto_editor, roto_confirm_img, subpixel_cutout_img, cutout_download, state, status_banner],
         )
 
         auto_roto_btn.click(
             on_step2_auto_roto,
             inputs=[frame_slider, trimap_rad, guided_rad, decont_slider, despill_chk, erode_dilate, state],
-            outputs=[roto_confirm_img, subpixel_cutout_img, cutout_download, state, status_banner],
+            outputs=[roto_editor, roto_confirm_img, subpixel_cutout_img, cutout_download, state, status_banner],
         )
 
         auto_chroma_btn.click(
             on_step2_auto_chroma_key,
             inputs=[frame_slider, trimap_rad, guided_rad, decont_slider, erode_dilate, state],
-            outputs=[roto_confirm_img, subpixel_cutout_img, cutout_download, state, status_banner],
+            outputs=[roto_editor, roto_confirm_img, subpixel_cutout_img, cutout_download, state, status_banner],
+        )
+
+        reset_roto_btn.click(
+            on_step2_reset_selection,
+            inputs=[frame_slider, state],
+            outputs=[roto_editor, roto_confirm_img, subpixel_cutout_img, cutout_download, state, status_banner],
         )
 
         step3_track_btn.click(

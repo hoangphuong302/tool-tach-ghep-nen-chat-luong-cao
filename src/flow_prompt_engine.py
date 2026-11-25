@@ -56,22 +56,64 @@ def analyze_scene_telemetry(
     if np.sum(bg_zone) < 200:
         bg_zone = np.ones((ah, aw), dtype=bool)
 
-    # 1. Measure Background Depth-of-Field / Bokeh Sharpness vs. Foreground
+    # 1. Measure Background Depth-of-Field & Estimate Equivalent Smartphone Focal Length (mm)
     gray = cv2.cvtColor(active_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
     lap = np.abs(cv2.Laplacian(gray, cv2.CV_32F, ksize=3))
     fg_sharp = float(np.percentile(lap[active_fg > 0], 90)) if np.any(active_fg > 0) else 25.0
     bg_sharp = float(np.percentile(lap[bg_zone], 90))
     sharp_ratio = fg_sharp / max(bg_sharp, 1.0)
 
-    if sharp_ratio > 2.2 or bg_sharp < 18.0:
-        bokeh_vi = "Xóa phông Bokeh mạnh (Ống kính tiêu cự 35mm-50mm, khẩu độ lớn f/1.8 - f/2.2, hậu cảnh mờ mịn)"
-        bokeh_en = "shallow depth of field (35mm-50mm prime lens at f/1.8-f/2.2) with soft, creamy out-of-focus background bokeh"
-    elif sharp_ratio > 1.35 or bg_sharp < 32.0:
-        bokeh_vi = "Xóa phông tự nhiên vừa phải (Tiêu cự ~35mm f/2.8, chủ thể nét căng, hậu cảnh dịu)"
-        bokeh_en = "natural medium-shallow depth of field (35mm lens at f/2.8), razor-sharp foreground plane with gently softened background"
+    # Photogrammetric foreground scale, focal length (mm), camera pitch & distance estimation
+    ys, xs = np.where(active_fg > 0)
+    if len(xs) > 0:
+        fg_ratio = round(float(len(xs)) / float(max(ah * aw, 1)) * 100.0, 1)
+        cy_norm = float(np.mean(ys)) / float(max(ah, 1))
+        x_span_ratio = float(np.max(xs) - np.min(xs) + 1) / float(max(aw, 1))
     else:
-        bokeh_vi = "Độ sâu trường ảnh rộng (Tiêu cự ~24mm-28mm f/4, hậu cảnh rõ chi tiết)"
-        bokeh_en = "deep focus smartphone/wide lens (26mm-28mm at f/4) with clear background architectural details"
+        fg_ratio = 35.0
+        cy_norm = 0.62
+        x_span_ratio = 0.58
+
+    if x_span_ratio >= 0.62:
+        focal_mm = 24
+        subj_dist_cm = 30
+    elif x_span_ratio >= 0.45:
+        focal_mm = 26
+        subj_dist_cm = 36
+    elif x_span_ratio >= 0.32:
+        focal_mm = 28
+        subj_dist_cm = 45
+    else:
+        focal_mm = 35
+        subj_dist_cm = 60
+
+    pitch_deg = int(round(-8.0 - max(0.0, cy_norm - 0.50) * 28.0))
+    roll_deg = 0
+    horizon_pct = int(round(np.clip(52.0 - (pitch_deg + 10) * 0.6, 38.0, 58.0)))
+
+    scale_calibration_vi = (
+        f"Ống kính điện thoại {focal_mm}mm (cảm biến phổ thông), cách bàn tay ~{subj_dist_cm}cm, "
+        f"góc nghiêng {pitch_deg}° hướng nhẹ xuống, đường chân trời ở ~{horizon_pct}% khung hình -> "
+        f"người và vật thể ở xa có tỷ lệ nhỏ tự nhiên đúng phối cảnh góc rộng {focal_mm}mm."
+    )
+    scale_calibration_en = (
+        f"shot on a casual mid-range consumer smartphone {focal_mm}mm wide lens from a {subj_dist_cm}cm foreground distance "
+        f"at a {abs(pitch_deg)}-degree downward POV pitch angle (0-degree roll), horizon at {horizon_pct}% frame height, "
+        f"keeping background people and architectural elements proportionally scaled to a natural {focal_mm}mm perspective"
+    )
+
+    if sharp_ratio > 2.2 or bg_sharp < 18.0:
+        bokeh_vi = f"Chất lượng điện thoại bình dân ({focal_mm}mm): nét tại tay/máy, hậu cảnh xa chỉ mờ nhòe rất nhẹ tự nhiên + nhiễu cảm biến nhẹ (KHÔNG xóa phông gắt DSLR)"
+        bokeh_en = (
+            f"casual mid-range smartphone optics ({focal_mm}mm f/2.2 small sensor) focused on the foreground plane at {subj_dist_cm}cm, "
+            "producing only very gentle natural far-background softness and subtle organic mobile sensor noise/grain — NO heavy DSLR f/1.8 bokeh and NO studio CGI sharpness"
+        )
+    else:
+        bokeh_vi = f"Chất lượng điện thoại bình dân ({focal_mm}mm): độ sâu trường ảnh rộng tự nhiên, hậu cảnh hơi mềm nhẹ và có nhiễu hạt cảm biến điện thoại thật"
+        bokeh_en = (
+            f"everyday consumer smartphone {focal_mm}mm lens aesthetic with natural deep mobile depth of field, "
+            "very slight natural softness in the far distance, and authentic subtle handheld phone camera grain (no artificial DSLR portrait blur)"
+        )
 
     # 2. Key Light Direction & Ambient Luminance
     mid_y, mid_x = ah // 2, aw // 2
@@ -112,19 +154,13 @@ def analyze_scene_telemetry(
         temp_vi = "Ánh sáng Ban ngày Trung tính (Neutral Daylight ~5400K)"
         temp_en = "natural 5400K neutral daylight with accurate skin-tone rendering"
 
-    # 4. Foreground Subject Placement & Camera Angle
-    ys, xs = np.where(active_fg > 0)
-    if len(xs) > 0:
-        fg_ratio = round(float(len(xs)) / float(max(ah * aw, 1)) * 100.0, 1)
-        cy_norm = float(np.mean(ys)) / float(max(ah, 1))
-    else:
-        fg_ratio = 35.0
-        cy_norm = 0.62
-
-    angle_vi = "Góc quay POV góc nhìn thứ nhất (First-Person POV), tầm mắt hơi hướng nhẹ xuống thiết bị trên tay, đường chân trời ở khoảng 50%-55% khung hình"
+    angle_vi = (
+        f"Góc quay POV góc nhìn thứ nhất (nghiêng {pitch_deg}° xuống tay/máy, độ nghiêng ngang {roll_deg}°), "
+        f"đường chân trời ở khoảng {horizon_pct}% chiều cao khung hình ({focal_mm}mm)."
+    )
     angle_en = (
-        "first-person POV eye-level shot angled slightly downward (~10 degrees) at the handheld device in the lower-center foreground, "
-        "with the background horizon line positioned at mid-frame (~52% height) and natural one-point perspective"
+        f"first-person POV eye-level shot angled ~{abs(pitch_deg)} degrees downward at the handheld device in the lower-center foreground, "
+        f"horizon line positioned at ~{horizon_pct}% height matching a {focal_mm}mm mobile camera perspective"
     )
 
     return {
@@ -137,6 +173,12 @@ def analyze_scene_telemetry(
         "is_green_screen": is_green_screen,
         "foreground_occupancy_pct": fg_ratio,
         "subject_center_y_norm": round(cy_norm, 2),
+        "focal_length_mm": focal_mm,
+        "camera_pitch_deg": pitch_deg,
+        "camera_roll_deg": roll_deg,
+        "subject_distance_cm": subj_dist_cm,
+        "scale_calibration_vi": scale_calibration_vi,
+        "scale_calibration_en": scale_calibration_en,
         "camera_angle_vi": angle_vi,
         "camera_angle_en": angle_en,
         "bokeh_blur_level": bokeh_vi,
@@ -166,8 +208,9 @@ def _translate_bg_concept_Via_agy_router(
     user_msg = (
         f"Vietnamese Background Idea: {target_background_vi}\n"
         f"Foreground Subject: {subject_description_vi}\n"
-        f"Optical Telemetry to Match: {telemetry['aspect_ratio_en']}, {telemetry['camera_angle_en']}, "
-        f"{telemetry['bokeh_en']}, {telemetry['lighting_en']}, {telemetry['color_temp_en']}."
+        f"Photogrammetric Lens & Realism Telemetry: {telemetry['aspect_ratio_en']}, "
+        f"{telemetry['scale_calibration_en']}, {telemetry['bokeh_en']}, "
+        f"{telemetry['lighting_en']}, {telemetry['color_temp_en']}."
     )
     payload = {
         "model": LOCAL_ROUTER_MODEL,
@@ -239,37 +282,40 @@ def generate_flow_prompts(
 
     # PROMPT 1: Google Flow Omni 1.2 Video-to-Video (KEEP / CHANGE / CONTROL)
     v2v_prompt = (
-        f"Video-to-video background transformation in {telemetry['aspect_ratio_en']}. "
+        f"Video-to-video background transformation in {telemetry['aspect_ratio_en']}, "
+        f"{telemetry['scale_calibration_en']}. "
         f"KEEP the exact foreground hands, finger positions, hand gestures, and the handheld electronic device completely unchanged, "
         f"preserving the device's exact rectangular geometry, black bezel, physical buttons, and original on-screen Vietnamese UI text without any alteration. "
         f"KEEP the exact original {telemetry['camera_angle_en']} and subtle handheld camera motion. "
         f"CHANGE only the background environment behind the hands and device into {ai_bg_en}. "
-        f"Match the original lens optics using {telemetry['bokeh_en']}, aligning the background horizon and perspective lines seamlessly with the camera's micro-movements. "
-        f"Illuminate the scene with {telemetry['lighting_en']} and {telemetry['color_temp_en']}, casting realistic soft ambient light wrap and subtle surface reflections onto the hands and device edges without altering the screen content. "
-        f"Maintain strict frame-to-frame temporal consistency with zero background flickering, zero device morphing into a smartphone, and no unrequested camera zooms."
+        f"Render the scene with {telemetry['bokeh_en']}, aligning the background horizon and perspective lines seamlessly with the camera's micro-movements. "
+        f"Illuminate the scene with {telemetry['lighting_en']} and {telemetry['color_temp_en']}, casting realistic soft ambient light wrap onto the hands and device edges without altering the screen content. "
+        f"Maintain strict frame-to-frame temporal consistency with zero background flickering, zero device morphing into a smartphone, and natural everyday mobile video realism."
     )
 
     # PROMPT 2: Clean Empty Background Plate (for 100% Real Hand + Product Cutout Compositing)
     clean_plate_prompt = (
-        f"Photorealistic clean background plate video in {telemetry['aspect_ratio_en']}, shot from a {telemetry['camera_angle_en']}. "
+        f"Photorealistic clean background plate video in {telemetry['aspect_ratio_en']}, "
+        f"{telemetry['scale_calibration_en']}. "
         f"The scene depicts {ai_bg_en}, with a completely clear, unobstructed empty foreground (no hands, no person, no handheld device in the foreground). "
-        f"Captured with {telemetry['bokeh_en']}, so the entire background environment has authentic optical defocus matching a close-up foreground focus plane at 40cm distance. "
-        f"Lighting features {telemetry['lighting_en']} at {telemetry['color_temp_en']} with natural spatial light gradients and realistic dynamic range. "
-        f"Include subtle, organic handheld camera breathing and micro-sway with strict frame-to-frame temporal stability, ready as a clean V2V compositing plate."
+        f"Captured with {telemetry['bokeh_en']}, focused around the empty {telemetry['subject_distance_cm']}cm foreground plane so far-away objects stay naturally recognizable with only slight mobile softness and authentic consumer phone sensor texture. "
+        f"Lighting features {telemetry['lighting_en']} at {telemetry['color_temp_en']} with natural spatial light gradients and realistic consumer mobile dynamic range. "
+        f"Include subtle, organic handheld phone camera breathing and micro-sway with strict frame-to-frame temporal stability, ready as a clean V2V compositing plate."
     )
 
-    full_markdown = f"""### A. Phân Tích Quang Học Từ Ảnh/Video Gốc & Chiến Lược (AGY Telemetry)
+    full_markdown = f"""### A. Phân Tích Quang Học Từ Ảnh/Video Gốc & Chiến Lược (AGY Photogrammetry Telemetry)
 - **Độ phân giải & Tỷ lệ khung hình thực:** `{telemetry['active_resolution']}` — **{telemetry['active_aspect_ratio']}** {"*(Đã phát hiện viền đen hai bên, tự động đo theo khung dọc thật ở giữa)*" if telemetry['is_pillarboxed'] else ""}
+- **Tiêu cự & Tỷ lệ phối cảnh (Photogrammetry):** `{telemetry['focal_length_mm']}mm` | Khoảng cách tay-máy ~`{telemetry['subject_distance_cm']}cm` | {telemetry['scale_calibration_vi']}
 - **Góc máy & Bố cục (Camera Framing):** {telemetry['camera_angle_vi']} (Chủ thể chiếm ~`{telemetry['foreground_occupancy_pct']}%` khung hình).
-- **Ống kính & Độ xóa phông (Bokeh / DoF):** {telemetry['bokeh_blur_level']}
+- **Quang học Điện thoại Bình dân (Smart DoF):** {telemetry['bokeh_blur_level']}
 - **Hướng sáng & Nhiệt độ màu gốc:** {telemetry['lighting_direction']} | {telemetry['color_temperature']}
 - **Giữ nguyên (KEEP):** {subj_vi} (Tách chuẩn từng sub-pixel từ video gốc: giữ 100% bàn tay thật, thiết bị thật và chữ tiếng Việt sắc nét trên màn hình).
-- **Thay đổi (CHANGE):** Đổi phông nền sang **{bg_idea}** với cùng tiêu cự xóa phông, độ cao đường chân trời và hướng chiếu sáng.
+- **Thay đổi (CHANGE):** Đổi phông nền sang **{bg_idea}** với đúng tiêu cự `{telemetry['focal_length_mm']}mm`, kích thước vật thể ở xa thực tế, góc nghiêng camera và ánh sáng gốc.
 
 ---
 
 ### B1. PROMPT TẠO VIDEO PHÔNG NỀN SẠCH (KHUYÊN DÙNG ĐỂ GHÉP TAY + SẢN PHẨM THẬT 100%)
-*(Copy prompt này sang **Google Flow / Veo** để tạo 1 video nền trống không dính tay/máy ảo, nhưng có góc máy, độ mờ Bokeh và ánh sáng khớp 100% với video gốc để nạp vào Tab Ghép Nền của Tool)*:
+*(Copy prompt này sang **Google Flow / Veo** để tạo 1 video nền trống đúng tiêu cự `{telemetry['focal_length_mm']}mm`, chất lượng quay điện thoại bình dân tự nhiên, không xóa phông giả, không dính tay/máy ảo)*:
 ```text
 {clean_plate_prompt}
 ```
@@ -286,7 +332,8 @@ def generate_flow_prompts(
 
 ### C. THÔNG TIN TÙY CHỈNH NHANH
 - **[Bối cảnh nền mới]:** `{bg_idea}` -> `{ai_bg_en}`
-- **[Độ mờ hậu cảnh (Bokeh)]:** `{telemetry['bokeh_en']}`
+- **[Tiêu cự & Tỷ lệ phối cảnh]:** `{telemetry['scale_calibration_en']}`
+- **[Độ sâu trường ảnh Điện thoại]:** `{telemetry['bokeh_en']}`
 - **[Hướng sáng & Màu nắng]:** `{telemetry['lighting_en']}`, `{telemetry['color_temp_en']}`
 """
 
