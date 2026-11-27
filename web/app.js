@@ -2,6 +2,21 @@
   const API_BASE = window.location.pathname.startsWith('/matting') ? '/matting/api' : '/api';
   const CHUNK_SIZE = 4 * 1024 * 1024;
   const IS_EMBED = new URLSearchParams(window.location.search).get('embed') === '1';
+  const SAVED_SESSION_KEY = 'agy_matting_saved_session_v1';
+  const PERSIST_CONTROL_IDS = [
+    'engineSelect', 'chkPyMatting', 'chkSmartRed',
+    'slBgScale', 'slBgOffsetX', 'slBgOffsetY', 'slBgMatchSrc',
+    'slBgBrightness', 'slBgContrast', 'slBgSaturation', 'slBgTemp', 'slBgTint',
+    'slUnifiedHarm', 'slContourRelight', 'slContourRad', 'slSharpMatch',
+    'slAmbient', 'slDirLight', 'slBlackPoint', 'slLwRad', 'slLwStr',
+    'slGlare', 'slGrain', 'slBgDefocus',
+    'chkProtectScreen', 'chkLinearComp', 'chkCleanGhost',
+    'slEdgePreserve', 'slDecont', 'slTrimap', 'slGuided', 'slErode', 'slEdgeBlur',
+    'selMatRes', 'chkDespill', 'chkPass2Legacy',
+    'selTracking', 'selAudio', 'chkAutoQaHeal',
+    'targetBgText', 'subjectDescText',
+    'outCleanPrompt', 'outV2vPrompt', 'outStillPrompt',
+  ];
 
   const state = {
     sid: null,
@@ -45,6 +60,8 @@
     lastAutoTracked: false,
     spaceDown: false,
     renderTimer: null,
+    activeJobId: null,
+    isRendering: false,
     promptVarSeed: 0,
     hasAnalyzedPrompts: false,
   };
@@ -98,10 +115,35 @@
     return data;
   }
 
+  function saveLocalState() {
+    if (!state.sid) return;
+    try {
+      const controls = {};
+      PERSIST_CONTROL_IDS.forEach((id) => {
+        const el = $(id);
+        if (!el) return;
+        controls[id] = el.type === 'checkbox' ? Boolean(el.checked) : el.value;
+      });
+      localStorage.setItem(SAVED_SESSION_KEY, JSON.stringify({
+        sid: state.sid,
+        currentStep: state.currentStep,
+        cutFrame: state.cutFrame,
+        compFrame: state.compFrame,
+        activeJobId: state.activeJobId,
+        controls,
+      }));
+    } catch (_) {}
+  }
+
+  function clearLocalState() {
+    try { localStorage.removeItem(SAVED_SESSION_KEY); } catch (_) {}
+  }
+
   async function ensureSession() {
     if (state.sid) return state.sid;
     const data = await apiJson('/session', { method: 'POST' });
     state.sid = data.session_id;
+    saveLocalState();
     return state.sid;
   }
 
@@ -112,6 +154,7 @@
 
   function switchStep(step) {
     state.currentStep = step;
+    saveLocalState();
     document.querySelectorAll('.step-tab').forEach((btn) => {
       const on = btn.dataset.step === step;
       btn.classList.toggle('active', on);
@@ -244,11 +287,13 @@
         if ($('promptVarBadge')) $('promptVarBadge').textContent = 'Mẫu #1';
         drawCompCanvas();
         await loadCutFrame(0);
+        saveLocalState();
         showToast(`Đã nạp ${comp.filename} (${comp.width}×${comp.height}, ${comp.frame_count} frames)`, 'ok');
       } else {
         state.bgMeta = comp;
         tag.textContent = `${comp.width}×${comp.height} · ${comp.frame_count}f`;
         tag.classList.add('ok');
+        saveLocalState();
         showToast(`Đã nạp nền mới ${comp.filename}`, 'ok');
         if (state.currentStep === 'composite') schedulePreview(true);
       }
@@ -671,6 +716,7 @@
       $('outCleanPrompt').value = res.clean_plate_prompt || '';
       $('outV2vPrompt').value = res.v2v_prompt || '';
       $('outStillPrompt').value = res.still_bg_prompt || '';
+      saveLocalState();
       const modeTag = res.reused_profile ? ` (Mẫu #${state.promptVarSeed + 1} · giữ nguyên thông số quang học)` : '';
       showToast(`Đã tạo 3 Prompt khóa camera đứng im chuẩn phối cảnh${modeTag}!`, 'ok');
     } catch (err) {
@@ -1021,17 +1067,24 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
+      state.activeJobId = res.job_id;
+      state.isRendering = true;
+      saveLocalState();
       pollRenderJob(res.job_id);
     } catch (err) {
       btn.disabled = false;
+      state.isRendering = false;
       showToast(`Lỗi bắt đầu render: ${err.message}`, 'err', 5000);
     }
   }
 
   async function pollRenderJob(jobId, failCount = 0) {
     clearTimeout(state.renderTimer);
+    if (!state.sid || !jobId) return;
+    state.activeJobId = jobId;
     try {
       const st = await apiJson(`/session/${state.sid}/render/${jobId}`);
+      $('renderJobBox').hidden = false;
       $('renderProgressFill').style.width = `${Math.round((st.progress || 0) * 100)}%`;
       $('renderStatusMsg').textContent = st.message || '';
       if (st.disk_mb !== undefined) updateDiskBadge(st.disk_mb);
@@ -1039,17 +1092,23 @@
       if (st.qa_report) renderQaReport(st.qa_report);
 
       if (st.status === 'done') {
+        state.isRendering = false;
         $('btnRenderFinal').disabled = false;
         $('downloadBox').hidden = false;
-        $('downloadVideoLink').href = `${API_BASE}/session/${state.sid}/download?kind=video&job_id=${jobId}&cleanup=1`;
-        showToast('Xuất video hoàn tất! Bấm tải về để lưu máy và xóa sạch dữ liệu tạm.', 'ok', 6000);
+        $('downloadVideoLink').href = `${API_BASE}/session/${state.sid}/download?kind=video&job_id=${jobId}&cleanup=0`;
+        saveLocalState();
+        showToast('Xuất video hoàn tất! Phiên vẫn được lưu giữ cho tới khi bấm "Xóa phiên".', 'ok', 6000);
         return;
       }
       if (st.status === 'error') {
+        state.isRendering = false;
         $('btnRenderFinal').disabled = false;
+        saveLocalState();
         showToast(st.message || 'Render lỗi', 'err', 6000);
         return;
       }
+      state.isRendering = true;
+      $('btnRenderFinal').disabled = true;
       state.renderTimer = setTimeout(() => pollRenderJob(jobId, 0), 1200);
     } catch (err) {
       if (err.status !== 404 && failCount < 15) {
@@ -1058,6 +1117,7 @@
         state.renderTimer = setTimeout(() => pollRenderJob(jobId, nextFail), 2000);
         return;
       }
+      state.isRendering = false;
       $('btnRenderFinal').disabled = false;
       showToast(`Lỗi kiểm tra tiến trình: ${err.message}`, 'err', 6000);
     }
@@ -1098,10 +1158,20 @@
   }
 
   async function manualCleanup() {
-    if (!state.sid) return;
+    if (!state.sid) {
+      clearLocalState();
+      return showToast('Hiện chưa có phiên nào đang lưu trên máy chủ.', 'info', 2400);
+    }
+    if (state.isRendering && !window.confirm('Video đang trong quá trình xuất. Bạn có chắc muốn xóa phiên hiện tại không?')) {
+      return;
+    }
+    clearTimeout(state.renderTimer);
     try {
       const res = await apiJson(`/session/${state.sid}/cleanup`, { method: 'POST' });
       state.sid = null;
+      state.activeJobId = null;
+      state.isRendering = false;
+      clearLocalState();
       state.srcMeta = null;
       state.bgMeta = null;
       state.cutImg = null;
@@ -1118,11 +1188,112 @@
       $('compEmptyOverlay').hidden = false;
       $('downloadBox').hidden = true;
       $('renderJobBox').hidden = true;
+      if ($('qaReportBox')) $('qaReportBox').hidden = true;
+      if ($('outCleanPrompt')) $('outCleanPrompt').value = '';
+      if ($('outV2vPrompt')) $('outV2vPrompt').value = '';
+      if ($('outStillPrompt')) $('outStillPrompt').value = '';
+      $('btnRenderFinal').disabled = false;
       drawCutCanvas();
       drawCompCanvas();
-      showToast(`Đã xóa sạch ${res.freed_mb} MB dữ liệu tạm trên máy chủ.`, 'ok');
+      showToast(`Đã xóa sạch phiên (${res.freed_mb} MB) trên máy chủ.`, 'ok');
     } catch (err) {
-      showToast(`Lỗi xóa tạm: ${err.message}`, 'err');
+      showToast(`Lỗi xóa phiên: ${err.message}`, 'err');
+    }
+  }
+
+  async function restoreSavedSession() {
+    let saved = null;
+    try {
+      const raw = localStorage.getItem(SAVED_SESSION_KEY);
+      if (raw) saved = JSON.parse(raw);
+    } catch (_) {}
+    if (!saved || !saved.sid) return;
+
+    // Restore slider/checkbox/textarea settings first
+    if (saved.controls && typeof saved.controls === 'object') {
+      Object.entries(saved.controls).forEach(([id, val]) => {
+        const el = $(id);
+        if (!el) return;
+        if (el.type === 'checkbox') {
+          el.checked = Boolean(val);
+        } else if (val !== undefined && val !== null) {
+          el.value = String(val);
+        }
+        const sp = document.querySelector(`[data-val-for="${id}"]`);
+        if (sp) sp.textContent = state._formatParamLabel ? state._formatParamLabel(el) : el.value;
+      });
+    }
+
+    try {
+      const st = await apiJson(`/session/${saved.sid}/state`);
+      state.sid = st.session_id;
+      updateDiskBadge(st.disk_mb);
+
+      if (st.src_meta) {
+        state.srcMeta = st.src_meta;
+        const maxF = Math.max(0, st.src_meta.frame_count - 1);
+        state.cutFrame = Math.min(maxF, Math.max(0, Number(saved.cutFrame || 0)));
+        state.compFrame = Math.min(maxF, Math.max(0, Number(saved.compFrame || 0)));
+        $('cutFrameSlider').max = maxF;
+        $('cutFrameSlider').value = state.cutFrame;
+        $('compFrameSlider').max = maxF;
+        $('compFrameSlider').value = state.compFrame;
+        $('cutFrameText').textContent = `${state.cutFrame} / ${maxF}`;
+        $('compFrameText').textContent = `${state.compFrame} / ${maxF}`;
+        $('srcMetaTag').textContent = `${st.src_meta.width}×${st.src_meta.height} · ${st.src_meta.frame_count}f`;
+        $('srcMetaTag').classList.add('ok');
+        $('cutEmptyOverlay').hidden = true;
+        strokeFgCanvas.width = st.src_meta.width;
+        strokeFgCanvas.height = st.src_meta.height;
+        strokeBgCanvas.width = st.src_meta.width;
+        strokeBgCanvas.height = st.src_meta.height;
+        clearStrokeLayers();
+      }
+      if (st.bg_meta) {
+        state.bgMeta = st.bg_meta;
+        $('bgMetaTag').textContent = `${st.bg_meta.width}×${st.bg_meta.height} · ${st.bg_meta.frame_count}f`;
+        $('bgMetaTag').classList.add('ok');
+      }
+      renderConfirmedPills(st.confirmed_frames || []);
+
+      if (st.src_meta) {
+        await loadCutFrame(state.cutFrame);
+      }
+
+      const targetStep = saved.currentStep && ['cut', 'prompt', 'composite'].includes(saved.currentStep)
+        ? saved.currentStep
+        : 'cut';
+      switchStep(targetStep);
+
+      const job = st.active_job;
+      if (job && job.job_id) {
+        state.activeJobId = job.job_id;
+        $('renderJobBox').hidden = false;
+        $('renderProgressFill').style.width = `${Math.round((job.progress || 0) * 100)}%`;
+        $('renderStatusMsg').textContent = job.message || '';
+        if (job.qa_report) renderQaReport(job.qa_report);
+        if (job.status === 'running') {
+          state.isRendering = true;
+          $('btnRenderFinal').disabled = true;
+          pollRenderJob(job.job_id);
+        } else if (job.status === 'done') {
+          state.isRendering = false;
+          $('btnRenderFinal').disabled = false;
+          $('downloadBox').hidden = false;
+          $('downloadVideoLink').href = `${API_BASE}/session/${state.sid}/download?kind=video&job_id=${job.job_id}&cleanup=0`;
+        } else if (job.status === 'error') {
+          state.isRendering = false;
+          $('btnRenderFinal').disabled = false;
+        }
+      }
+
+      if (st.src_meta || st.bg_meta) {
+        showToast(`♻️ Đã khôi phục phiên đang làm dở (${Number(st.disk_mb || 0).toFixed(1)} MB).`, 'ok', 4200);
+      }
+    } catch (err) {
+      if (err.status === 404) {
+        clearLocalState();
+      }
     }
   }
 
@@ -1231,8 +1402,11 @@
 
     $('cutFrameSlider').addEventListener('input', (e) => {
       const f = Number(e.target.value);
+      state.cutFrame = f;
+      state.compFrame = f;
       $('compFrameSlider').value = f;
       $('compFrameText').textContent = `${f} / ${$('compFrameSlider').max}`;
+      saveLocalState();
       loadCutFrame(f);
     });
 
@@ -1273,6 +1447,7 @@
       c.addEventListener('click', () => {
         document.querySelectorAll('#bgPresets .chip').forEach((x) => x.classList.toggle('active', x === c));
         $('targetBgText').value = c.dataset.bg;
+        saveLocalState();
         if (state.sid && state.srcMeta && state.hasAnalyzedPrompts) {
           analyzeAndGeneratePrompts({ regenerate: true, forceReanalyze: false });
         }
@@ -1323,6 +1498,7 @@
       const f = Number(e.target.value);
       $('compFrameText').textContent = `${f} / ${$('compFrameSlider').max}`;
       state.compFrame = f;
+      saveLocalState();
       schedulePreview(true);
     });
 
@@ -1348,6 +1524,7 @@
         const sp = document.querySelector(`[data-val-for="${id}"]`);
         if (sp) sp.textContent = state._formatParamLabel ? state._formatParamLabel(el) : val;
       });
+      saveLocalState();
       schedulePreview(true);
       showToast('Đã đặt lại kích thước, vị trí và màu sắc nền về mặc định.', 'ok', 2200);
     });
@@ -1361,24 +1538,24 @@
       syncVal();
       el.addEventListener('input', () => {
         syncVal();
+        saveLocalState();
         schedulePreview(false, HEAVY_EDGE_IDS.has(el.id) ? 120 : 60);
       });
       el.addEventListener('change', () => {
         syncVal();
+        saveLocalState();
         schedulePreview(true);
       });
     });
 
+    ['engineSelect', 'chkPyMatting', 'chkSmartRed', 'selMatRes', 'selTracking', 'selAudio', 'chkAutoQaHeal', 'targetBgText', 'subjectDescText'].forEach((id) => {
+      const el = $(id);
+      if (el) el.addEventListener('change', saveLocalState);
+    });
+
     $('btnRenderFinal').addEventListener('click', startFinalRender);
     $('downloadVideoLink').addEventListener('click', () => {
-      showToast('Đang tải video về máy — dữ liệu trên máy chủ sẽ tự động xóa sau khi tải xong.', 'ok', 6500);
-      setTimeout(async () => {
-        try {
-          const h = await apiJson('/health');
-          updateDiskBadge(0);
-          if (h.active_sessions === 0) $('diskBadge').textContent = '✅ Đã dọn máy chủ';
-        } catch (_) {}
-      }, 4500);
+      showToast('Đang tải video về máy — phiên vẫn được lưu giữ cho tới khi bạn bấm "Xóa phiên".', 'ok', 4800);
     });
 
     window.addEventListener('keydown', (e) => {
@@ -1411,17 +1588,13 @@
       drawCompCanvas();
     });
 
-    // Clean up orphaned temp session when user closes the tab
-    window.addEventListener('pagehide', () => {
-      if (state.sid && navigator.sendBeacon) {
-        navigator.sendBeacon(`${API_BASE}/session/${state.sid}/cleanup`, new Blob());
-      }
-    });
-
+    // Session persists across F5 / tab reload — only deleted when user clicks "Xóa phiên".
     apiJson('/health').then((h) => {
       const gpuEl = $('gpuBadge');
       if (gpuEl) gpuEl.textContent = h.cuda_available ? 'RTX CUDA Ready' : 'CPU Mode';
     }).catch(() => {});
+
+    restoreSavedSession();
   }
 
   bindAll();

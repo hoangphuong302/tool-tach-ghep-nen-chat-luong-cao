@@ -38,10 +38,10 @@
       </nav>
 
       <div class="topbar-right">
-        <span id="diskBadge" class="pill-stat" title="Dung lượng file tạm phiên hiện tại trên máy chủ">Phiên: 0 MB</span>
-        <button type="button" id="cleanupBtn" class="btn btn-ghost btn-sm" title="Xóa toàn bộ file tạm của phiên này trên máy chủ">
+        <span id="diskBadge" class="pill-stat" title="Dung lượng phiên hiện tại trên máy chủ (tự lưu kể cả khi F5)">Phiên: 0 MB</span>
+        <button type="button" id="cleanupBtn" class="btn btn-ghost btn-sm" title="Xóa toàn bộ phiên hiện tại (video gốc, nền, mask và bản dựng) trên máy chủ">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
-          <span>Xóa tạm</span>
+          <span>Xóa phiên</span>
         </button>
         <button type="button" id="themeBtn" class="btn btn-ghost btn-sm" title="Đổi giao diện Sáng / Tối">🌙 Tối</button>
       </div>
@@ -531,9 +531,9 @@
 
             <div id="downloadBox" class="download-box" hidden>
               <a id="downloadVideoLink" class="btn btn-success btn-block" href="#" download="AGY_TachNen_GhepCanh.mp4">
-                ⬇️ Tải Video Về Máy &amp; Tự Xóa Dữ Liệu Máy Chủ
+                ⬇️ Tải Video Về Máy (MP4)
               </a>
-              <p class="small-note">Ngay khi quá trình tải xuống hoàn tất, toàn bộ video gốc, frame tách và bản dựng trên máy chủ sẽ tự động được xóa sạch.</p>
+              <p class="small-note">Phiên làm việc (video gốc, nền, mask và video đã xuất) vẫn được lưu an toàn kể cả khi tải xuống hoặc bấm F5. Chỉ khi bạn bấm nút "Xóa phiên" ở góc trên bên phải mới xóa dữ liệu trên máy chủ.</p>
             </div>
           </div>
         </aside>

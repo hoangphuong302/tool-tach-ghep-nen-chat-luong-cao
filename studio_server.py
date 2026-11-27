@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import json
 import mimetypes
 import os
 import shutil
@@ -78,7 +79,8 @@ REMOTE_SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 MAX_CHUNK_BYTES = 16 * 1024 * 1024
-SESSION_TTL_SECONDS = max(300, int(os.environ.get("MATTING_SESSION_TTL_SECONDS", "3600")))
+# Default 0 = keep user's work-in-progress sessions until explicitly deleted via "Xóa phiên" button.
+SESSION_TTL_SECONDS = max(0, int(os.environ.get("MATTING_SESSION_TTL_SECONDS", "0")))
 
 ENGINE_MAP = {
     "matanyone2": legacy_app.MATTING_ENGINE_MATANYONE2,
@@ -155,6 +157,7 @@ class SessionState:
     lock: threading.RLock = field(default_factory=threading.RLock)
 
     src_media: Optional[str] = None
+    src_filename: str = ""
     src_is_image: bool = False
     src_frames: List[Path] = field(default_factory=list)
     fps: float = 30.0
@@ -162,9 +165,12 @@ class SessionState:
     height: int = 0
 
     bg_media: Optional[str] = None
+    bg_filename: str = ""
     bg_is_image: bool = False
     bg_frames: List[Path] = field(default_factory=list)
     bg_fps: float = 30.0
+    bg_width: int = 0
+    bg_height: int = 0
 
     confirmed_masks: Dict[int, Path] = field(default_factory=dict)
     undo_stacks: Dict[int, List[np.ndarray]] = field(default_factory=dict)
@@ -192,6 +198,124 @@ class SessionStore:
         self._lock = threading.Lock()
         self._sessions: Dict[str, SessionState] = {}
 
+    def save_meta(self, sess: SessionState) -> None:
+        """Persist lightweight session metadata to disk so F5 and server restarts never lose work."""
+        if not sess.work_dir.exists():
+            return
+        try:
+            with sess.lock:
+                jobs_clean: Dict[str, Dict[str, Any]] = {}
+                for jid, j in sess.jobs.items():
+                    jobs_clean[jid] = {
+                        "job_id": str(j.get("job_id", jid)),
+                        "status": str(j.get("status", "")),
+                        "progress": float(j.get("progress", 0.0)),
+                        "message": str(j.get("message", "")),
+                        "output_path": str(j.get("output_path", "")),
+                        "output_mb": float(j.get("output_mb", 0.0)),
+                        "disk_mb": float(j.get("disk_mb", 0.0)),
+                        "qa_report": j.get("qa_report"),
+                    }
+                meta = {
+                    "session_id": sess.session_id,
+                    "created_at": float(sess.created_at),
+                    "last_active": float(sess.last_active),
+                    "src_media": sess.src_media,
+                    "src_filename": sess.src_filename,
+                    "src_is_image": bool(sess.src_is_image),
+                    "fps": float(sess.fps),
+                    "width": int(sess.width),
+                    "height": int(sess.height),
+                    "bg_media": sess.bg_media,
+                    "bg_filename": sess.bg_filename,
+                    "bg_is_image": bool(sess.bg_is_image),
+                    "bg_fps": float(sess.bg_fps),
+                    "bg_width": int(sess.bg_width),
+                    "bg_height": int(sess.bg_height),
+                    "jobs": jobs_clean,
+                }
+            meta_p = sess.work_dir / "session_meta.json"
+            tmp_p = sess.work_dir / "session_meta.json.tmp"
+            tmp_p.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+            tmp_p.replace(meta_p)
+        except Exception:
+            pass
+
+    def _load_from_disk(self, sid: str) -> Optional[SessionState]:
+        if not sid or not all(c.isalnum() or c in ("-", "_") for c in sid):
+            return None
+        wdir = self.base_dir / sid
+        meta_p = wdir / "session_meta.json"
+        if not wdir.is_dir() or not meta_p.is_file():
+            return None
+        try:
+            meta = json.loads(meta_p.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+        src_dir = wdir / "src_frames"
+        bg_dir = wdir / "bg_frames"
+        conf_dir = wdir / "confirmed_masks"
+
+        src_frames = sorted(
+            [p for p in src_dir.iterdir() if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png")]
+        ) if src_dir.is_dir() else []
+        bg_frames = sorted(
+            [p for p in bg_dir.iterdir() if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png")]
+        ) if bg_dir.is_dir() else []
+
+        confirmed: Dict[int, Path] = {}
+        if conf_dir.is_dir():
+            for p in sorted(conf_dir.glob("conf_*.png")):
+                try:
+                    f_idx = int(p.stem.split("_", 1)[1])
+                    confirmed[f_idx] = p
+                except Exception:
+                    continue
+
+        jobs: Dict[str, Dict[str, Any]] = {}
+        for jid, j in (meta.get("jobs") or {}).items():
+            if not isinstance(j, dict):
+                continue
+            j_copy = dict(j)
+            out_p = str(j_copy.get("output_path") or "")
+            if j_copy.get("status") == "running":
+                if out_p and Path(out_p).is_file() and Path(out_p).stat().st_size > 1024:
+                    j_copy["status"] = "done"
+                    j_copy["progress"] = 1.0
+                else:
+                    j_copy["status"] = "error"
+                    j_copy["message"] = "Máy chủ vừa khởi động lại khi đang render — video gốc, nền và mask vẫn được giữ nguyên, hãy bấm Xuất lại."
+            elif j_copy.get("status") == "done" and (not out_p or not Path(out_p).is_file()):
+                continue
+            jobs[str(jid)] = j_copy
+
+        sess = SessionState(
+            session_id=sid,
+            work_dir=wdir,
+            created_at=float(meta.get("created_at", time.time())),
+            last_active=time.time(),
+            src_media=meta.get("src_media"),
+            src_filename=str(meta.get("src_filename") or (Path(meta["src_media"]).name if meta.get("src_media") else "")),
+            src_is_image=bool(meta.get("src_is_image", False)),
+            src_frames=src_frames,
+            fps=float(meta.get("fps", 30.0)),
+            width=int(meta.get("width", 0)),
+            height=int(meta.get("height", 0)),
+            bg_media=meta.get("bg_media"),
+            bg_filename=str(meta.get("bg_filename") or (Path(meta["bg_media"]).name if meta.get("bg_media") else "")),
+            bg_is_image=bool(meta.get("bg_is_image", False)),
+            bg_frames=bg_frames,
+            bg_fps=float(meta.get("bg_fps", 30.0)),
+            bg_width=int(meta.get("bg_width", 0)),
+            bg_height=int(meta.get("bg_height", 0)),
+            confirmed_masks=confirmed,
+            jobs=jobs,
+        )
+        with self._lock:
+            self._sessions[sid] = sess
+        return sess
+
     def create(self) -> SessionState:
         sid = uuid.uuid4().hex[:16]
         wdir = self.base_dir / sid
@@ -199,11 +323,14 @@ class SessionStore:
         sess = SessionState(session_id=sid, work_dir=wdir)
         with self._lock:
             self._sessions[sid] = sess
+        self.save_meta(sess)
         return sess
 
     def get(self, sid: str) -> SessionState:
         with self._lock:
             sess = self._sessions.get(sid)
+        if sess is None:
+            sess = self._load_from_disk(sid)
         if sess is None or not sess.work_dir.exists():
             raise HTTPException(status_code=404, detail="Phiên làm việc không tồn tại hoặc đã được dọn dẹp.")
         sess.touch()
@@ -234,6 +361,8 @@ class SessionStore:
         return freed_mb
 
     def sweep_expired(self) -> int:
+        if self.ttl_seconds <= 0:
+            return 0
         now = time.time()
         with self._lock:
             expired = [
@@ -261,9 +390,14 @@ class SessionStore:
 
     def stats(self) -> Dict[str, Any]:
         with self._lock:
-            count = len(self._sessions)
+            mem_ids = set(self._sessions.keys())
+        disk_ids = {
+            p.name
+            for p in self.base_dir.iterdir()
+            if p.is_dir() and (p / "session_meta.json").is_file()
+        } if self.base_dir.exists() else set()
         return {
-            "active_sessions": count,
+            "active_sessions": len(mem_ids | disk_ids),
             "total_disk_mb": _dir_size_mb(self.base_dir),
         }
 
@@ -416,6 +550,7 @@ def _save_confirmed_mask(sess: SessionState, f_idx: int, mask: np.ndarray, push_
     sess.comp_cache.clear()
     sess.preview_auto_cache.clear()
     sess.optical_profile_cache = None
+    STORE.save_meta(sess)
     return out_p
 
 
@@ -808,6 +943,14 @@ def _run_render_job(sess: SessionState, job_id: str, req: RenderReq) -> None:
             bg_media = sess.bg_media
             tracked_paths = list(sess.tracked_masks)
             work = sess.work_dir
+            # Free preview RAM caches before heavy MatAnyone 2 / GPU render so virtual memory stays lean
+            sess.matte_cache.clear()
+            sess.bg_cache.clear()
+            sess.comp_cache.clear()
+            sess.preview_auto_cache.clear()
+        import gc
+        gc.collect()
+        clear_vram()
 
         n_src = len(src_frames)
         if n_src == 0:
@@ -1166,14 +1309,16 @@ def _run_render_job(sess: SessionState, job_id: str, req: RenderReq) -> None:
         job.update(
             status="done",
             progress=1.0,
-            message=f"Hoàn tất {n_src} frames ({out_mb} MB). Đã tự động dọn file trung gian.",
+            message=f"Hoàn tất {n_src} frames ({out_mb} MB). Phiên vẫn được giữ cho tới khi bấm Xóa phiên.",
             output_path=str(out_mp4),
             output_mb=out_mb,
             disk_mb=_dir_size_mb(work),
         )
+        STORE.save_meta(sess)
     except Exception as exc:
         traceback.print_exc()
         job.update(status="error", message=f"Lỗi render: {exc}")
+        STORE.save_meta(sess)
 
 
 # ---------------------------------------------------------------------------
@@ -1335,6 +1480,7 @@ def upload_complete(sid: str, uid: str):
             if sess.src_media and Path(sess.src_media).exists():
                 Path(sess.src_media).unlink(missing_ok=True)
             sess.src_media = str(dst_path)
+            sess.src_filename = up["filename"]
             sess.src_is_image = is_image
             sess.src_frames = frames
             sess.fps = fps
@@ -1353,11 +1499,16 @@ def upload_complete(sid: str, uid: str):
             if sess.bg_media and Path(sess.bg_media).exists():
                 Path(sess.bg_media).unlink(missing_ok=True)
             sess.bg_media = str(dst_path)
+            sess.bg_filename = up["filename"]
             sess.bg_is_image = is_image
             sess.bg_frames = frames
             sess.bg_fps = fps
+            sess.bg_width = w
+            sess.bg_height = h
             sess.bg_cache.clear()
             sess.comp_cache.clear()
+
+    STORE.save_meta(sess)
 
     return {
         "role": role,
@@ -1536,6 +1687,7 @@ def reset_mask(sid: str, req: FrameActionReq):
         sess.comp_cache.clear()
         sess.preview_auto_cache.clear()
         sess.optical_profile_cache = None
+        STORE.save_meta(sess)
         return {"ok": True, "confirmed_frames": sorted(sess.confirmed_masks.keys()), "disk_mb": _dir_size_mb(sess.work_dir)}
 
 
@@ -1625,6 +1777,59 @@ def preview_composite(sid: str, req: PreviewReq):
     }
 
 
+@router.get("/api/session/{sid}/state")
+def get_session_state(sid: str):
+    """Return full work-in-progress session state so browser F5/reopen resumes seamlessly."""
+    sess = STORE.get(sid)
+    with sess.lock:
+        src_meta = None
+        if sess.src_frames:
+            src_meta = {
+                "filename": sess.src_filename or (Path(sess.src_media).name if sess.src_media else "source"),
+                "frame_count": len(sess.src_frames),
+                "fps": round(float(sess.fps or 30.0), 2),
+                "width": int(sess.width),
+                "height": int(sess.height),
+                "is_image": bool(sess.src_is_image),
+            }
+        bg_meta = None
+        if sess.bg_frames:
+            bg_meta = {
+                "filename": sess.bg_filename or (Path(sess.bg_media).name if sess.bg_media else "background"),
+                "frame_count": len(sess.bg_frames),
+                "fps": round(float(sess.bg_fps or 30.0), 2),
+                "width": int(sess.bg_width),
+                "height": int(sess.bg_height),
+                "is_image": bool(sess.bg_is_image),
+            }
+        confirmed_list = sorted(sess.confirmed_masks.keys())
+        active_job = None
+        if sess.jobs:
+            running = [j for j in sess.jobs.values() if j.get("status") == "running"]
+            latest = running[-1] if running else list(sess.jobs.values())[-1]
+            jid = str(latest.get("job_id", ""))
+            dl_url = f"api/session/{sid}/download?kind=video&job_id={jid}&cleanup=0" if latest.get("status") == "done" else ""
+            active_job = {
+                "job_id": jid,
+                "status": latest.get("status", ""),
+                "progress": round(float(latest.get("progress", 0.0)), 3),
+                "message": latest.get("message", ""),
+                "output_mb": latest.get("output_mb", 0.0),
+                "disk_mb": latest.get("disk_mb", 0.0),
+                "download_url": dl_url,
+                "qa_report": latest.get("qa_report"),
+            }
+        disk_mb = _dir_size_mb(sess.work_dir)
+    return {
+        "session_id": sid,
+        "disk_mb": disk_mb,
+        "src_meta": src_meta,
+        "bg_meta": bg_meta,
+        "confirmed_frames": confirmed_list,
+        "active_job": active_job,
+    }
+
+
 @router.post("/api/session/{sid}/render")
 def start_render(sid: str, req: RenderReq):
     sess = STORE.get(sid)
@@ -1644,6 +1849,7 @@ def start_render(sid: str, req: RenderReq):
             "output_mb": 0.0,
             "disk_mb": _dir_size_mb(sess.work_dir),
         }
+    STORE.save_meta(sess)
 
     t = threading.Thread(target=_run_render_job, args=(sess, jid, req), daemon=True)
     t.start()
@@ -1657,7 +1863,7 @@ def render_status(sid: str, jid: str):
         job = sess.jobs.get(jid)
     if job is None:
         raise HTTPException(status_code=404, detail="Không tìm thấy tác vụ render.")
-    dl_url = f"api/session/{sid}/download?kind=video&job_id={jid}&cleanup=1" if job.get("status") == "done" else ""
+    dl_url = f"api/session/{sid}/download?kind=video&job_id={jid}&cleanup=0" if job.get("status") == "done" else ""
     return {
         "job_id": jid,
         "status": job["status"],

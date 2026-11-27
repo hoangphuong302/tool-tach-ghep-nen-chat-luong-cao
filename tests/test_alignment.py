@@ -18,9 +18,38 @@ from src.spatial_align import (
 from src.temporal_sync import _dtw_sakoe_chiba, smooth_fractional_mapping
 
 
+def _load_or_make_alignment_frame() -> np.ndarray:
+    p = ROOT / "workspace/taxi_test/src_f0.jpg"
+    if p.is_file():
+        img = cv2.imread(str(p))
+        if img is not None:
+            return img
+    # Self-contained synthetic natural-camera 1080x1920 frame with unique non-repeating landmarks
+    rng = np.random.default_rng(42)
+    h, w = 1920, 1080
+    base = cv2.resize(rng.integers(50, 200, (96, 54, 3), dtype=np.uint8), (w, h), interpolation=cv2.INTER_CUBIC)
+    img = base.copy()
+    for i in range(180):
+        cx, cy = int(rng.integers(40, w - 40)), int(rng.integers(40, h - 40))
+        rad = int(rng.integers(14, 58))
+        col = tuple(int(c) for c in rng.integers(25, 240, 3))
+        if i % 3 == 0:
+            cv2.circle(img, (cx, cy), rad, col, -1)
+        elif i % 3 == 1:
+            pts = rng.integers(-rad, rad + 1, (4, 2)) + np.array([cx, cy])
+            cv2.fillConvexPoly(img, pts.astype(np.int32), col)
+        else:
+            cv2.putText(img, f"M{i}", (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.7 + (i % 4) * 0.25, col, 2)
+    # Distinct bezel & screen interior with sharp step right at mask boundary [370:700, 760:1330]
+    img[760:1331, 370:701] = (232, 232, 232)
+    img[778:1313, 388:683] = (30, 45, 95)
+    for k in range(8):
+        cv2.putText(img, f"ITEM-{k*17}", (415, 845 + k * 55), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (240, 240, 240), 2)
+    return img
+
+
 def test_ecc_recovers_known_motion():
-    img = cv2.imread(str(ROOT / "workspace/taxi_test/src_f0.jpg"))
-    assert img is not None, "need workspace/taxi_test/src_f0.jpg"
+    img = _load_or_make_alignment_frame()
     h, w = img.shape[:2]
     mask = np.zeros((h, w), np.uint8)
     cv2.rectangle(mask, (370, 760), (700, 1330), 1, -1)
@@ -86,7 +115,7 @@ def test_interpolation_places_object_midway():
 
 def test_blur_sigma_estimation():
     from src.spatial_align import estimate_blur_sigma
-    img = cv2.imread(str(ROOT / "workspace/taxi_test/src_f0.jpg"))
+    img = _load_or_make_alignment_frame()
     mask = np.zeros(img.shape[:2], np.uint8)
     cv2.rectangle(mask, (370, 760), (700, 1330), 1, -1)
     out = []
