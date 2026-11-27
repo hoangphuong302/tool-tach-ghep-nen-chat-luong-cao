@@ -39,6 +39,7 @@
     previewAbort: null,
     previewTimer: null,
     lastElapsedMs: 0,
+    lastAutoTracked: false,
     spaceDown: false,
     renderTimer: null,
   };
@@ -687,11 +688,11 @@
     };
   }
 
-  function schedulePreview(immediate = false) {
+  function schedulePreview(immediate = false, delayMs = 60) {
     if (!state.sid || !state.srcMeta) return;
     if (!immediate && !$('chkLivePreview').checked) return;
     clearTimeout(state.previewTimer);
-    state.previewTimer = setTimeout(fetchLivePreview, immediate ? 0 : 60);
+    state.previewTimer = setTimeout(fetchLivePreview, immediate ? 0 : delayMs);
   }
 
   async function fetchLivePreview() {
@@ -712,11 +713,13 @@
       let data = {};
       try { data = text ? JSON.parse(text) : {}; } catch (_) {}
       if (!res.ok) {
+        drawCompCanvas();
         if (res.status === 400) showToast(data.detail || 'Chưa có mask', 'info');
         else showToast(data.detail || data.error || `Preview lỗi (HTTP ${res.status})`, 'err');
         return;
       }
       state.lastElapsedMs = data.elapsed_ms || 0;
+      state.lastAutoTracked = Boolean(data.auto_tracked);
       $('compEmptyOverlay').hidden = true;
 
       const lImg = new Image();
@@ -735,7 +738,10 @@
       lImg.src = data.left_b64;
       rImg.src = data.right_b64;
     } catch (err) {
-      if (err.name !== 'AbortError') showToast(`Preview: ${err.message}`, 'err');
+      if (err.name !== 'AbortError') {
+        drawCompCanvas();
+        showToast(`Preview: ${err.message}`, 'err');
+      }
     }
   }
 
@@ -795,7 +801,8 @@
 
     const badge = $('compZoomBadge');
     if (badge) {
-      badge.textContent = `${state.compZoom.toFixed(2)}× · ${state.lastElapsedMs}ms · Kéo vạch chia | Lăn chuột Zoom`;
+      const autoPrefix = state.lastAutoTracked ? `⚡ Tự bắt khung ${state.compFrame} · ` : '';
+      badge.textContent = `${autoPrefix}${state.compZoom.toFixed(2)}× · ${state.lastElapsedMs}ms · Kéo vạch chia | Lăn chuột Zoom`;
     }
   }
 
@@ -1192,7 +1199,13 @@
       const f = Number(e.target.value);
       $('compFrameText').textContent = `${f} / ${$('compFrameSlider').max}`;
       state.compFrame = f;
-      schedulePreview(false);
+      schedulePreview(false, 180);
+    });
+    $('compFrameSlider').addEventListener('change', (e) => {
+      const f = Number(e.target.value);
+      $('compFrameText').textContent = `${f} / ${$('compFrameSlider').max}`;
+      state.compFrame = f;
+      schedulePreview(true);
     });
 
     $('btnRefreshPreview').addEventListener('click', () => schedulePreview(true));

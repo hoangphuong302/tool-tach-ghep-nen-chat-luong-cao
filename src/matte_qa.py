@@ -195,17 +195,36 @@ def heal_device_bezel_notches(
     return out.astype(np.float32), healed_px, full_mask
 
 
+def _is_green_screen_exterior(bgr: np.ndarray, ext_mask: np.ndarray) -> bool:
+    """Return True when the unmasked exterior background is predominantly chroma green."""
+    if int(np.sum(ext_mask)) < 200:
+        return False
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    b = bgr[..., 0].astype(np.float32)
+    g = bgr[..., 1].astype(np.float32)
+    r = bgr[..., 2].astype(np.float32)
+    g_exc = g - np.maximum(b, r)
+    strong_green = (g_exc > 15.0) & (hsv[..., 0] >= 32) & (hsv[..., 0] <= 96) & (hsv[..., 1] >= 35)
+    return float(np.mean(strong_green[ext_mask])) >= 0.22
+
+
+def is_green_screen_scene(bgr: np.ndarray, alpha: np.ndarray) -> bool:
+    """Check whether the exterior background outside foreground `alpha` is a green screen."""
+    a_f = np.asarray(alpha, dtype=np.float32)
+    return _is_green_screen_exterior(bgr, a_f <= 0.12)
+
+
 def heal_universal_structural_defects(
     bgr: np.ndarray,
     alpha: np.ndarray,
 ) -> Tuple[np.ndarray, int, np.ndarray]:
     """
     Universal per-frame structural guard for ANY subject (book, person, product, gadget):
-      1. Enclosed Pinhole Guard: fills tiny interior enclosed holes (<= 0.15% of frame,
-         e.g. bright reflections on book pages or clothing) surrounded by alpha >= 0.72,
-         without filling real exterior gaps between arms/fingers.
-      2. Rigid Rectangular Device Guard (`heal_device_bezel_notches`): only fires when
-         a rectangular handheld device interior is detected; no-op otherwise.
+      1. Rigid Rectangular Device Guard (`heal_device_bezel_notches`).
+      2. Color-Aware Enclosed Pinhole Guard: fills interior holes matching foreground tone,
+         without filling real exterior background gaps (e.g. room wall or green-screen slit).
+      3. Trapped Green-Screen Crevice Punch-Out: cleans shadowed green-screen gaps between
+         fingers and subject while protecting glowing device UI screens.
     """
     a_f, bezel_px, bezel_mask = heal_device_bezel_notches(bgr, alpha)
     h, w = a_f.shape[:2]
@@ -213,15 +232,32 @@ def heal_universal_structural_defects(
     if min(h, w) < 32 or not np.any(fg_u8 > 0):
         return a_f, bezel_px, bezel_mask
 
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    b_ch = bgr[..., 0].astype(np.float32)
+    g_ch = bgr[..., 1].astype(np.float32)
+    r_ch = bgr[..., 2].astype(np.float32)
+    g_exc = g_ch - np.maximum(b_ch, r_ch)
+    is_green_strong = (g_exc > 18.0) & (hsv[..., 0] >= 28) & (hsv[..., 0] <= 102) & (hsv[..., 1] >= 35)
+    is_green_soft = (g_exc > 8.0) & (hsv[..., 0] >= 28) & (hsv[..., 0] <= 104) & (hsv[..., 1] >= 18)
+
+    ext_zone = a_f <= 0.08
+    is_green_bg = _is_green_screen_exterior(bgr, ext_zone)
+
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    w_lab = np.array([0.65, 1.15, 1.15], dtype=np.float32)
+    ext_ring = (cv2.dilate(fg_u8, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (41, 41))) > 0) & (fg_u8 == 0)
+    bg_sample = ext_ring if int(np.sum(ext_ring)) >= 40 else ext_zone
+    if np.any(bg_sample):
+        bg_vals = lab[bg_sample]
+        bg_q = np.percentile(bg_vals, [20, 50, 80], axis=0) if len(bg_vals) >= 6 else np.median(bg_vals, axis=0)[None, :]
+    else:
+        bg_q = None
+
     inv = (1 - fg_u8).astype(np.uint8)
     max_hole_area = max(48, int(h * w * 0.006))
     num_cc, labels, stats, _ = cv2.connectedComponentsWithStats(inv, connectivity=8)
     pinhole_mask = np.zeros((h, w), dtype=np.uint8)
     k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    g_exc = bgr[..., 1].astype(np.float32) - np.maximum(bgr[..., 0].astype(np.float32), bgr[..., 2].astype(np.float32))
-    is_green = (g_exc > 18.0) & (hsv[..., 0] >= 28) & (hsv[..., 0] <= 102) & (hsv[..., 1] >= 35)
 
     for cid in range(1, num_cc):
         area = int(stats[cid, cv2.CC_STAT_AREA])
@@ -234,19 +270,68 @@ def heal_universal_structural_defects(
         if x0 <= 0 or y0 <= 0 or x0 + cw >= w or y0 + ch >= h:
             continue
         comp = labels == cid
-        if float(np.mean(is_green[comp])) > 0.35:
+        if is_green_bg and float(np.mean(is_green_soft[comp])) > 0.25:
             continue
-        ring = (cv2.dilate(comp.astype(np.uint8), k5) > 0) & (~comp)
-        if np.any(ring) and float(np.mean(a_f[ring])) >= 0.72:
-            pinhole_mask[comp] = 1
+        if not is_green_bg and float(np.mean(is_green_strong[comp])) > 0.35:
+            continue
+        ring = (cv2.dilate(comp.astype(np.uint8), k5) > 0) & (a_f >= 0.45)
+        if not np.any(ring) or float(np.mean(a_f[ring])) < 0.72:
+            continue
+        if bg_q is not None:
+            hole_med = np.median(lab[comp], axis=0)
+            d_bg = float(np.min(np.linalg.norm((bg_q - hole_med[None, :]) * w_lab[None, :], axis=1)))
+            fg_med = np.median(lab[ring], axis=0)
+            d_fg = float(np.linalg.norm((fg_med - hole_med) * w_lab))
+            if d_bg < d_fg * 0.95 or d_bg < 22.0:
+                continue
+        pinhole_mask[comp] = 1
 
     pin_px = int(np.sum(pinhole_mask > 0))
     if pin_px > 0:
         a_pin = cv2.GaussianBlur(pinhole_mask.astype(np.float32), (3, 3), 0.6)
         a_f = np.maximum(a_f, np.clip(a_pin, 0.0, 1.0))
-        combined = ((bezel_mask > 0) | (pinhole_mask > 0)).astype(np.uint8)
-        return a_f.astype(np.float32), bezel_px + pin_px, combined
-    return a_f.astype(np.float32), bezel_px, bezel_mask
+
+    # Stage 3: Trapped Green-Screen Crevice Punch-Out (only on green-screen scenes)
+    crevice_px = 0
+    punch_mask = np.zeros((h, w), dtype=np.uint8)
+    if is_green_bg:
+        from src.relight_harmonizer import detect_emissive_screen_mask
+
+        fg_bin_now = (a_f >= 0.45).astype(np.uint8)
+        fg_area = max(1, int(np.sum(fg_bin_now > 0)))
+        screen_raw = detect_emissive_screen_mask(bgr, fg_bin_now)
+        screen_protect = cv2.dilate(screen_raw, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))) > 0
+
+        crevice_cand = (
+            (a_f > 0.04)
+            & (~screen_protect)
+            & (g_exc > 7.0)
+            & (hsv[..., 0] >= 30)
+            & (hsv[..., 0] <= 104)
+            & (hsv[..., 1] >= 18)
+            & (lab[..., 1] < 124.0)
+        )
+        if np.any(crevice_cand):
+            ext_loose = (a_f <= 0.12).astype(np.uint8)
+            near_ext = cv2.dilate(ext_loose, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (85, 85))) > 0
+            n_cr, l_cr, st_cr, _ = cv2.connectedComponentsWithStats(crevice_cand.astype(np.uint8), connectivity=8)
+            max_cr_area = max(16, int(0.06 * fg_area))
+            for cid in range(1, n_cr):
+                c_area = int(st_cr[cid, cv2.CC_STAT_AREA])
+                if c_area < 6:
+                    continue
+                comp = l_cr == cid
+                if np.any(comp & near_ext) or c_area <= max_cr_area:
+                    punch_mask[comp] = 1
+
+            crevice_px = int(np.sum(punch_mask > 0))
+            if crevice_px > 0:
+                punch_soft = cv2.GaussianBlur(punch_mask.astype(np.float32), (3, 3), 0.7)
+                a_f = a_f * (1.0 - np.clip(punch_soft * 1.15, 0.0, 1.0))
+
+    total_healed = bezel_px + pin_px + crevice_px
+    combined = ((bezel_mask > 0) | (pinhole_mask > 0) | (punch_mask > 0)).astype(np.uint8)
+    return np.clip(a_f, 0.0, 1.0).astype(np.float32), total_healed, combined
 
 
 def audit_and_heal_video_mattes(

@@ -92,10 +92,14 @@ def _init_sam2_video_state_bounded(predictor, frame_files: List[Path], scratch_d
     return state
 
 
-def _fill_mask_holes(mask: np.ndarray, max_hole_ratio: float = 0.0012) -> np.ndarray:
+def _fill_mask_holes(
+    mask: np.ndarray,
+    max_hole_ratio: float = 0.0012,
+    bgr: Optional[np.ndarray] = None,
+) -> np.ndarray:
     """
     Fill only tiny enclosed interior pinholes (e.g. text/icons inside screen) WITHOUT
-    filling real finger-to-device gaps or expanding concave outer contours.
+    filling real exterior background gaps (e.g. finger-to-device or arm-to-book slits).
     """
     m = (mask > 0).astype(np.uint8)
     h, w = m.shape[:2]
@@ -103,6 +107,33 @@ def _fill_mask_holes(mask: np.ndarray, max_hole_ratio: float = 0.0012) -> np.nda
 
     inv = (1 - m).astype(np.uint8)
     num_cc, labels, stats, _ = cv2.connectedComponentsWithStats(inv, connectivity=8)
+
+    use_color_guard = bgr is not None and bgr.shape[:2] == (h, w) and num_cc > 1
+    if use_color_guard:
+        assert bgr is not None
+        lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        b_ch, g_ch, r_ch = (bgr[..., 0].astype(np.float32), bgr[..., 1].astype(np.float32), bgr[..., 2].astype(np.float32))
+        is_green_soft = ((g_ch - np.maximum(r_ch, b_ch)) > 8.0) & (hsv[..., 0] >= 28) & (hsv[..., 0] <= 104) & (hsv[..., 1] >= 18)
+        bg_ring = (cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (41, 41))) > 0) & (m == 0)
+        bg_zone = bg_ring if int(np.sum(bg_ring)) >= 40 else (m == 0)
+        if np.any(bg_zone):
+            bg_vals = lab[bg_zone]
+            bg_q = np.percentile(bg_vals, [20, 50, 80], axis=0) if len(bg_vals) >= 6 else np.median(bg_vals, axis=0)[None, :]
+            ext_is_green = float(np.mean(is_green_soft[bg_zone])) >= 0.15
+        else:
+            bg_q = None
+            ext_is_green = False
+        w_lab = np.array([0.65, 1.15, 1.15], dtype=np.float32)
+        k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    else:
+        lab = None
+        is_green_soft = None
+        bg_q = None
+        ext_is_green = False
+        w_lab = None
+        k5 = None
+
     for cid in range(1, num_cc):
         x0 = stats[cid, cv2.CC_STAT_LEFT]
         y0 = stats[cid, cv2.CC_STAT_TOP]
@@ -110,7 +141,24 @@ def _fill_mask_holes(mask: np.ndarray, max_hole_ratio: float = 0.0012) -> np.nda
         ch = stats[cid, cv2.CC_STAT_HEIGHT]
         area = stats[cid, cv2.CC_STAT_AREA]
         touches_border = (x0 <= 0) or (y0 <= 0) or (x0 + cw >= w) or (y0 + ch >= h)
-        if not touches_border and area <= max_hole_area:
+        if touches_border or area > max_hole_area:
+            continue
+        if use_color_guard and bg_q is not None:
+            comp = labels == cid
+            if ext_is_green and float(np.mean(is_green_soft[comp])) > 0.30:
+                continue
+            hole_med = np.median(lab[comp], axis=0)
+            d_bg = float(np.min(np.linalg.norm((bg_q - hole_med[None, :]) * w_lab[None, :], axis=1)))
+            fg_ring = (cv2.dilate(comp.astype(np.uint8), k5) > 0) & (m > 0)
+            if np.any(fg_ring):
+                fg_med = np.median(lab[fg_ring], axis=0)
+                d_fg = float(np.linalg.norm((fg_med - hole_med) * w_lab))
+            else:
+                d_fg = 1e9
+            if d_bg < d_fg * 0.95 or d_bg < 22.0:
+                continue
+            m[comp] = 1
+        else:
             m[labels == cid] = 1
     return m
 
@@ -237,7 +285,7 @@ def roto_snap_color_boundary(
         if 0 <= py < h and 0 <= px < w and l_cc[py, px] > 0:
             valid_mask[l_cc == l_cc[py, px]] = 1
     valid_mask = cv2.morphologyEx(valid_mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
-    valid_mask = _fill_mask_holes(valid_mask)
+    valid_mask = _fill_mask_holes(valid_mask, bgr=cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
 
     # Punch out any enclosed green-screen finger gaps AFTER pinhole filling so finger gaps stay transparent
     green_excess = g_ch - np.maximum(r_ch, b_ch)
@@ -712,7 +760,7 @@ def smart_roto_brush_refine(
                             hit_ids = set(np.unique(l_cc[max(0, by0 - 4):min(h, by1 + 4), max(0, bx0 - 4):min(w, bx1 + 4)]).tolist()) - {0}
                             if hit_ids:
                                 box_mask = np.isin(l_cc, list(hit_ids)).astype(np.uint8)
-                        box_mask = _fill_mask_holes(box_mask)
+                        box_mask = _fill_mask_holes(box_mask, bgr=bgr)
                         if has_bg:
                             box_mask[bg_u8 > 0] = 0
                         box_mask, _ = expand_mask_with_color_evidence(bgr, box_mask, pixels=1)
@@ -805,7 +853,7 @@ def smart_roto_brush_refine(
                                     added_total[l_cc == l_cc[cy, cx]] = 1
 
                         added_total[fg_u8 > 0] = 1
-                        added_total = _fill_mask_holes(added_total)
+                        added_total = _fill_mask_holes(added_total, bgr=bgr)
                         if has_bg:
                             added_total[bg_u8 > 0] = 0
                         added_total, _ = expand_mask_with_color_evidence(bgr, added_total, pixels=1)
@@ -1026,7 +1074,7 @@ def auto_cut_universal_hybrid(
 
         if np.any(recovered > 0):
             mask_out = ((mask_bi > 0) | (recovered > 0)).astype(np.uint8)
-            mask_out = _fill_mask_holes(mask_out, max_hole_ratio=0.0015)
+            mask_out = _fill_mask_holes(mask_out, max_hole_ratio=0.0015, bgr=src_bgr)
             local_a = refine_alpha_edge_controls(
                 src_bgr,
                 mask_out.astype(np.float32),

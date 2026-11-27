@@ -53,6 +53,7 @@ def estimate_foreground_pymatting(
     alpha: np.ndarray,
     strength: float = 1.0,
     despill_green: bool = False,
+    fast_preview: bool = False,
 ) -> np.ndarray:
     """
     Solve the physical compositing equation I = alpha * F + (1 - alpha) * B using
@@ -81,7 +82,9 @@ def estimate_foreground_pymatting(
             roi_rgb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB).astype(np.float64) / 255.0
             roi_a = alpha_f[y0:y1, x0:x1].astype(np.float64)
 
-            max_dim = 960
+            max_dim = 480 if fast_preview else 960
+            n_small = 5 if fast_preview else 8
+            n_big = 1
             if max(rh, rw) > max_dim:
                 scale = max_dim / float(max(rh, rw))
                 sw = max(32, int(round(rw * scale)))
@@ -91,16 +94,16 @@ def estimate_foreground_pymatting(
                 est_small = estimate_foreground_ml(
                     in_rgb,
                     in_a,
-                    n_small_iterations=8,
-                    n_big_iterations=1,
+                    n_small_iterations=n_small,
+                    n_big_iterations=n_big,
                 )
                 est_rgb = cv2.resize(est_small, (rw, rh), interpolation=cv2.INTER_LINEAR)
             else:
                 est_rgb = estimate_foreground_ml(
                     roi_rgb,
                     roi_a,
-                    n_small_iterations=10,
-                    n_big_iterations=2,
+                    n_small_iterations=n_small if fast_preview else 10,
+                    n_big_iterations=n_big if fast_preview else 2,
                 )
             est_bgr = np.clip(est_rgb[..., ::-1], 0.0, 1.0).astype(np.float32)
 

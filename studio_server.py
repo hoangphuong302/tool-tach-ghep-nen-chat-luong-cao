@@ -36,7 +36,11 @@ from src.flow_prompt_engine import (
     analyze_video_optical_profile,
     generate_matched_background_prompts,
 )
-from src.matte_qa import audit_and_heal_video_mattes, heal_universal_structural_defects
+from src.matte_qa import (
+    audit_and_heal_video_mattes,
+    heal_universal_structural_defects,
+    is_green_screen_scene,
+)
 from src.neural_matting import (
     estimate_foreground_pymatting,
     release_neural_models,
@@ -172,6 +176,7 @@ class SessionState:
     matte_cache: OrderedDict = field(default_factory=OrderedDict)
     bg_cache: OrderedDict = field(default_factory=OrderedDict)
     comp_cache: OrderedDict = field(default_factory=OrderedDict)
+    preview_auto_cache: OrderedDict = field(default_factory=OrderedDict)
 
     def touch(self) -> None:
         self.last_active = time.time()
@@ -212,6 +217,7 @@ class SessionStore:
                 sess.matte_cache.clear()
                 sess.bg_cache.clear()
                 sess.comp_cache.clear()
+                sess.preview_auto_cache.clear()
                 sess.birefnet_alpha_by_frame.clear()
                 sess.undo_stacks.clear()
         if target_dir.exists():
@@ -389,6 +395,7 @@ def _save_confirmed_mask(sess: SessionState, f_idx: int, mask: np.ndarray, push_
     sess.confirmed_masks[f_idx] = out_p
     sess.matte_cache.clear()
     sess.comp_cache.clear()
+    sess.preview_auto_cache.clear()
     return out_p
 
 
@@ -421,27 +428,128 @@ def _get_bg_frame_bgr(sess: SessionState, f_idx: int, src_bgr: np.ndarray) -> Tu
     return bg_resized, key
 
 
+def _ensure_preview_frame_matte(
+    sess: SessionState,
+    f_idx: int,
+    src_bgr: np.ndarray,
+    req: PreviewReq,
+) -> Tuple[np.ndarray, Optional[np.ndarray], bool]:
+    """
+    Resolve mask & optional soft alpha for Live Preview on ANY video frame.
+    Confirmed/tracked frames return `(mask, soft_alpha, False)`.
+    Unconfirmed frames auto-segment on demand from the nearest confirmed keyframe
+    so frame scrubbing and sliders work seamlessly across the entire timeline.
+    """
+    existing = _load_session_frame_mask(sess, f_idx)
+    if existing is not None:
+        soft_a = sess.birefnet_alpha_by_frame.get(f_idx) if f_idx in sess.confirmed_masks else None
+        return existing, soft_a, False
+
+    valid_conf = [k for k, p in sess.confirmed_masks.items() if p.is_file()]
+    if not valid_conf:
+        raise HTTPException(
+            status_code=400,
+            detail="Chưa có vùng chọn nào. Hãy bấm '🎯 AI Toàn diện' hoặc '⬜ Khoanh vùng' trên Bước 1 trước.",
+        )
+
+    engine_label = _resolve_engine_label(req.matting_engine)
+    use_ai = legacy_app._is_ai_engine(engine_label)
+    cache_key = (f_idx, bool(use_ai))
+    if cache_key in sess.preview_auto_cache:
+        sess.preview_auto_cache.move_to_end(cache_key)
+        cm, ca = sess.preview_auto_cache[cache_key]
+        return cm, ca, True
+
+    ref_idx = min(valid_conf, key=lambda k: abs(k - f_idx))
+    ref_mask = load_mask(sess.confirmed_masks[ref_idx])
+    if not use_ai:
+        sess.preview_auto_cache[cache_key] = (ref_mask, None)
+        sess.preview_auto_cache.move_to_end(cache_key)
+        while len(sess.preview_auto_cache) > 24:
+            sess.preview_auto_cache.popitem(last=False)
+        return ref_mask, None, True
+
+    h, w = src_bgr.shape[:2]
+    ref_area = max(1, int(np.sum(ref_mask > 0)))
+    biref_alpha = run_birefnet_matting(src_bgr, max_size=768)
+    biref_area = int(np.sum(biref_alpha >= 0.45))
+
+    # Disambiguate extra detections against nearest confirmed frame appearance & location
+    if biref_area > 1.8 * ref_area and ref_idx < len(sess.src_frames) and np.any(ref_mask > 0):
+        n_cc, labels, stats, _ = cv2.connectedComponentsWithStats((biref_alpha >= 0.35).astype(np.uint8), connectivity=8)
+        if n_cc > 2:
+            ref_bgr = _load_bgr(sess.src_frames[ref_idx])
+            if ref_bgr.shape[:2] != (h, w):
+                ref_bgr = cv2.resize(ref_bgr, (w, h), interpolation=cv2.INTER_AREA)
+            ref_lab = cv2.cvtColor(ref_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+            cur_lab = cv2.cvtColor(src_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+            ref_med = np.median(ref_lab[ref_mask > 0], axis=0)
+            ry, rx = np.mean(np.where(ref_mask > 0), axis=1)
+
+            scored: List[Tuple[float, int, int]] = []
+            min_comp = max(64, int(ref_area * 0.04))
+            for cid in range(1, n_cc):
+                c_area = int(stats[cid, cv2.CC_STAT_AREA])
+                if c_area < min_comp:
+                    continue
+                comp = labels == cid
+                c_med = np.median(cur_lab[comp], axis=0)
+                col_dist = float(np.linalg.norm(c_med - ref_med))
+                cy, cx = np.mean(np.where(comp), axis=1)
+                sp_dist = float(np.hypot((cy - ry) / max(h, 1), (cx - rx) / max(w, 1)) * 100.0)
+                scored.append((col_dist + 0.15 * sp_dist, cid, c_area))
+
+            if scored:
+                scored.sort(key=lambda item: item[0])
+                best_score = scored[0][0]
+                keep_ids = [
+                    cid
+                    for (sc, cid, c_area) in scored
+                    if cid == scored[0][1] or (c_area >= ref_area * 0.25 and sc <= best_score * 1.35 + 8.0)
+                ]
+                keep_u8 = np.isin(labels, keep_ids).astype(np.uint8)
+                gate = cv2.dilate(keep_u8, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17))).astype(np.float32)
+                gate = cv2.GaussianBlur(gate, (7, 7), 0)
+                biref_alpha = np.clip(biref_alpha * gate, 0.0, 1.0).astype(np.float32)
+
+    if int(np.sum(biref_alpha >= 0.45)) < max(64, int(0.15 * ref_area)):
+        try:
+            _, u_alpha = auto_cut_universal_hybrid(src_bgr, max_size=768, prefer_best_checkpoint=True)
+            if int(np.sum(u_alpha >= 0.45)) >= max(64, int(0.15 * ref_area)):
+                biref_alpha = u_alpha
+            else:
+                biref_alpha = ref_mask.astype(np.float32)
+        except Exception:
+            biref_alpha = ref_mask.astype(np.float32)
+
+    alpha_f = np.clip(biref_alpha.astype(np.float32), 0.0, 1.0)
+    mask_u8 = (alpha_f >= 0.5).astype(np.uint8)
+    sess.preview_auto_cache[cache_key] = (mask_u8, alpha_f)
+    sess.preview_auto_cache.move_to_end(cache_key)
+    while len(sess.preview_auto_cache) > 24:
+        sess.preview_auto_cache.popitem(last=False)
+    return mask_u8, alpha_f, True
+
+
 def _get_matte_and_fg(
     sess: SessionState,
     f_idx: int,
     src_bgr: np.ndarray,
     req: PreviewReq,
-) -> Tuple[np.ndarray, np.ndarray, Tuple[object, ...]]:
+) -> Tuple[np.ndarray, np.ndarray, Tuple[object, ...], bool]:
     h, w = src_bgr.shape[:2]
     engine_label = _resolve_engine_label(req.matting_engine)
-    mask = _load_session_frame_mask(sess, f_idx)
-    if mask is None:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Khung {f_idx} chưa có vùng chọn. Hãy bấm 'Tự tách AI 1-Click' hoặc quét cọ trên Bước 1 trước.",
-        )
+    mask, soft_alpha, auto_tracked = _ensure_preview_frame_matte(sess, f_idx, src_bgr, req)
 
-    mask_path = sess.confirmed_masks.get(f_idx) or (
-        sess.tracked_masks[f_idx] if f_idx < len(sess.tracked_masks) else None
-    )
-    m_sig = (str(mask_path), mask_path.stat().st_mtime_ns) if mask_path and mask_path.is_file() else (f_idx,)
-    biref_cached = sess.birefnet_alpha_by_frame.get(f_idx)
-    biref_sig = hashlib.sha1(biref_cached[:16, :16].tobytes()).hexdigest() if biref_cached is not None else "none"
+    if auto_tracked:
+        m_sig: Tuple[object, ...] = ("auto", f_idx, bool(legacy_app._is_ai_engine(engine_label)))
+    else:
+        mask_path = sess.confirmed_masks.get(f_idx) or (
+            sess.tracked_masks[f_idx] if f_idx < len(sess.tracked_masks) else None
+        )
+        m_sig = (str(mask_path), mask_path.stat().st_mtime_ns) if mask_path and mask_path.is_file() else (f_idx,)
+
+    biref_sig = hashlib.sha1(soft_alpha[:16, :16].tobytes()).hexdigest() if soft_alpha is not None else "none"
 
     m_key = (
         f_idx,
@@ -461,16 +569,16 @@ def _get_matte_and_fg(
     cached = sess.matte_cache.get(m_key)
     if cached is not None:
         sess.matte_cache.move_to_end(m_key)
-        return cached[0], cached[1], m_key
+        return cached[0], cached[1], m_key, auto_tracked
 
     if (
-        biref_cached is not None
-        and biref_cached.shape == (h, w)
-        and f_idx in sess.confirmed_masks
+        soft_alpha is not None
+        and soft_alpha.shape == (h, w)
+        and (f_idx in sess.confirmed_masks or auto_tracked)
         and req.matting_engine in ("birefnet", "matanyone2")
     ):
-        base_alpha = biref_cached
-        if float(req.edge_preserve) > 0.01:
+        base_alpha = soft_alpha
+        if float(req.edge_preserve) > 0.01 or is_green_screen_scene(src_bgr, base_alpha):
             base_alpha, _, _ = heal_universal_structural_defects(src_bgr, base_alpha)
         alpha = refine_alpha_edge_controls(
             src_bgr,
@@ -481,12 +589,16 @@ def _get_matte_and_fg(
             edge_preserve=float(req.edge_preserve),
             edge_feather=float(req.edge_blur_match),
         )
+        effective_despill = bool(req.despill_green) or (
+            float(req.decont_strength) > 0.05 and is_green_screen_scene(src_bgr, alpha)
+        )
         fg_clean = (
             estimate_foreground_pymatting(
                 src_bgr,
                 alpha,
                 strength=float(req.decont_strength),
-                despill_green=bool(req.despill_green),
+                despill_green=effective_despill,
+                fast_preview=True,
             )
             if req.use_pymatting_fg
             else src_bgr
@@ -504,7 +616,7 @@ def _get_matte_and_fg(
         )
         mres = extract_pixel_accurate_matte(src_bgr, mask, mcfg)
         base_alpha = mres.alpha
-        if float(req.edge_preserve) > 0.01:
+        if float(req.edge_preserve) > 0.01 or is_green_screen_scene(src_bgr, base_alpha):
             base_alpha, _, _ = heal_universal_structural_defects(src_bgr, base_alpha)
         alpha = refine_alpha_edge_controls(
             src_bgr,
@@ -515,17 +627,22 @@ def _get_matte_and_fg(
             edge_preserve=float(req.edge_preserve),
             edge_feather=float(req.edge_blur_match),
         )
+        effective_despill = bool(req.despill_green) or (
+            float(req.decont_strength) > 0.05 and is_green_screen_scene(src_bgr, alpha)
+        )
         alpha_shifted = (
             abs(float(req.erode_dilate)) >= 0.05
             or float(req.edge_blur_match) > 0.05
             or abs(float(req.edge_preserve) - 0.45) > 0.02
+            or (effective_despill and not req.despill_green)
         )
         if req.use_pymatting_fg and alpha_shifted:
             fg_clean = estimate_foreground_pymatting(
                 src_bgr,
                 alpha,
                 strength=float(req.decont_strength),
-                despill_green=bool(req.despill_green),
+                despill_green=effective_despill,
+                fast_preview=True,
             )
         else:
             fg_clean = mres.fg_clean_bgr
@@ -534,16 +651,16 @@ def _get_matte_and_fg(
     sess.matte_cache.move_to_end(m_key)
     while len(sess.matte_cache) > 4:
         sess.matte_cache.popitem(last=False)
-    return fg_clean, alpha, m_key
+    return fg_clean, alpha, m_key, auto_tracked
 
 
-def _compute_preview_bundle(sess: SessionState, req: PreviewReq) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _compute_preview_bundle(sess: SessionState, req: PreviewReq) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool]:
     if not sess.src_frames:
         raise HTTPException(status_code=400, detail="Chưa tải video/ảnh gốc lên phiên.")
     f_idx = int(np.clip(req.frame_idx, 0, len(sess.src_frames) - 1))
     src_bgr = _load_bgr(sess.src_frames[f_idx])
     bg_bgr, bg_sig = _get_bg_frame_bgr(sess, f_idx, src_bgr)
-    fg_clean, alpha, m_key = _get_matte_and_fg(sess, f_idx, src_bgr, req)
+    fg_clean, alpha, m_key, auto_tracked = _get_matte_and_fg(sess, f_idx, src_bgr, req)
 
     comp_key = (
         m_key,
@@ -604,6 +721,7 @@ def _compute_preview_bundle(sess: SessionState, req: PreviewReq) -> Tuple[np.nda
         cv2.cvtColor(fg_clean, cv2.COLOR_BGR2RGB),
         alpha,
         scr_mask,
+        bool(auto_tracked),
     )
     sess.comp_cache[comp_key] = bundle
     sess.comp_cache.move_to_end(comp_key)
@@ -794,12 +912,15 @@ def _run_render_job(sess: SessionState, job_id: str, req: RenderReq) -> None:
         ) -> np.ndarray:
             fg_clean = fg_clean_opt
             if fg_clean is None:
+                eff_despill = bool(req.despill_green) or (
+                    float(req.decont_strength) > 0.05 and is_green_screen_scene(src_bgr, alpha_t)
+                )
                 fg_clean = (
                     estimate_foreground_pymatting(
                         src_bgr,
                         alpha_t,
                         strength=float(req.decont_strength),
-                        despill_green=bool(req.despill_green),
+                        despill_green=eff_despill,
                     )
                     if req.use_pymatting_fg
                     else src_bgr
@@ -870,6 +991,7 @@ def _run_render_job(sess: SessionState, job_id: str, req: RenderReq) -> None:
                     or abs(float(req.erode_dilate)) >= 0.05
                     or float(req.edge_blur_match) > 0.05
                     or float(req.edge_preserve) > 0.01
+                    or (not req.despill_green and float(req.decont_strength) > 0.05 and is_green_screen_scene(src_bgr, alpha_t))
                 ):
                     raw_fg_opt = None
 
@@ -934,8 +1056,17 @@ def serve_index():
     idx_file = WEB_DIR / "index.html"
     if not idx_file.is_file():
         raise HTTPException(status_code=500, detail="Missing web/index.html")
+    html = idx_file.read_text(encoding="utf-8")
+    ver_candidates = [int(idx_file.stat().st_mtime_ns)]
+    for asset_name in ("app.js", "styles.css"):
+        asset_p = WEB_DIR / asset_name
+        if asset_p.is_file():
+            ver_candidates.append(int(asset_p.stat().st_mtime_ns))
+    ver = str(max(ver_candidates))
+    html = html.replace('./static/styles.css"', f'./static/styles.css?v={ver}"')
+    html = html.replace('./static/app.js"', f'./static/app.js?v={ver}"')
     return HTMLResponse(
-        content=idx_file.read_text(encoding="utf-8"),
+        content=html,
         headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
     )
 
@@ -947,7 +1078,7 @@ def serve_static(filepath: str):
     if not str(target).startswith(str(web_root)) or not target.is_file():
         raise HTTPException(status_code=404, detail="Not found")
     ctype, _ = mimetypes.guess_type(str(target))
-    return FileResponse(str(target), media_type=ctype or "application/octet-stream", headers={"Cache-Control": "no-cache"})
+    return FileResponse(str(target), media_type=ctype or "application/octet-stream", headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
 
 
 @router.get("/api/health")
@@ -1272,6 +1403,7 @@ def reset_mask(sid: str, req: FrameActionReq):
         sess.birefnet_alpha_by_frame.pop(f_idx, None)
         sess.matte_cache.clear()
         sess.comp_cache.clear()
+        sess.preview_auto_cache.clear()
         return {"ok": True, "confirmed_frames": sorted(sess.confirmed_masks.keys()), "disk_mb": _dir_size_mb(sess.work_dir)}
 
 
@@ -1312,7 +1444,7 @@ def preview_composite(sid: str, req: PreviewReq):
     t0 = time.perf_counter()
     sess = STORE.get(sid)
     with sess.lock:
-        src_rgb, comp_rgb, fg_rgb, alpha, scr_mask = _compute_preview_bundle(sess, req)
+        src_rgb, comp_rgb, fg_rgb, alpha, scr_mask, auto_tracked = _compute_preview_bundle(sess, req)
 
     diag_label = DIAG_MAP.get(req.diag_mode, legacy_app.PREVIEW_DIAG_SPLIT)
     left_rgb, right_rgb = legacy_app._render_preview_view(
@@ -1340,6 +1472,7 @@ def preview_composite(sid: str, req: PreviewReq):
         "right_b64": _encode_jpeg_b64(right_rgb, quality=88),
         "width": w,
         "height": h,
+        "auto_tracked": bool(auto_tracked),
         "elapsed_ms": round((time.perf_counter() - t0) * 1000.0, 1),
     }
 
@@ -1407,7 +1540,7 @@ def download_result(
             f_idx = int(np.clip(frame_idx, 0, len(sess.src_frames) - 1))
             src_bgr = _load_bgr(sess.src_frames[f_idx])
             req = PreviewReq(frame_idx=f_idx, matting_engine=engine, use_pymatting_fg=bool(use_pymatting_fg))
-            fg_clean, alpha, _ = _get_matte_and_fg(sess, f_idx, src_bgr, req)
+            fg_clean, alpha, _, _ = _get_matte_and_fg(sess, f_idx, src_bgr, req)
             a_u8 = np.clip(alpha * 255.0, 0, 255).astype(np.uint8)
             rgba = np.dstack([fg_clean, a_u8])
             file_path = sess.work_dir / f"cutout_frame_{f_idx:05d}.png"

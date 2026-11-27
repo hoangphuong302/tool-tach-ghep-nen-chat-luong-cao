@@ -470,3 +470,114 @@ def test_smart_roto_brush_preserves_birefnet_alpha_and_undo_restores_it(tmp_path
     ur = client.post(f"/matting/api/session/{sid}/undo", json={"frame_idx": 0})
     assert ur.status_code == 200 and ur.json()["ok"] is True
     assert float(np.max(np.abs(sess.birefnet_alpha_by_frame[0] - init_alpha))) < 1e-5
+
+
+def test_preview_any_unconfirmed_frame_and_slider_updates(tmp_path, monkeypatch) -> None:
+    store = studio_server.SessionStore(base_dir=tmp_path / "sessions", ttl_seconds=600)
+    monkeypatch.setattr(studio_server, "STORE", store)
+    client = TestClient(studio_server.app)
+
+    # 1. Cache-busting on index HTML & static JS
+    idx_res = client.get("/matting/")
+    assert idx_res.status_code == 200
+    assert "./static/styles.css?v=" in idx_res.text
+    assert "./static/app.js?v=" in idx_res.text
+    js_res = client.get("/matting/static/app.js")
+    assert js_res.status_code == 200
+    assert "no-store" in js_res.headers.get("cache-control", "").lower()
+
+    # Create a 6-frame MP4 clip with a moving blue-ish foreground rectangle
+    src_mp4 = tmp_path / "scrub_src.mp4"
+    writer = cv2.VideoWriter(str(src_mp4), cv2.VideoWriter_fourcc(*"mp4v"), 12.0, (160, 160))
+    for i in range(6):
+        fr = np.full((160, 160, 3), (30, 35, 40), dtype=np.uint8)
+        x0 = 20 + i * 8
+        cv2.rectangle(fr, (x0, 35), (x0 + 50, 125), (210, 140, 70), -1)
+        writer.write(fr)
+    writer.release()
+
+    sid = client.post("/matting/api/session").json()["session_id"]
+    sess = store.get(sid)
+    raw_bytes = src_mp4.read_bytes()
+    ui = client.post(
+        f"/matting/api/session/{sid}/upload/init",
+        json={"role": "source", "filename": "scrub_src.mp4", "total_size": len(raw_bytes)},
+    )
+    uid = ui.json()["upload_id"]
+    client.put(f"/matting/api/session/{sid}/upload/{uid}/chunk?index=0", content=raw_bytes)
+    client.post(f"/matting/api/session/{sid}/upload/{uid}/complete")
+
+    # Empty session without ANY confirmed mask must return 400
+    r_empty = client.post(
+        f"/matting/api/session/{sid}/preview",
+        json={"frame_idx": 4, "matting_engine": "classic"},
+    )
+    assert r_empty.status_code == 400
+
+    # Confirm ONLY frame 0
+    mask0 = np.zeros((160, 160), dtype=np.uint8)
+    mask0[35:125, 20:70] = 1
+    studio_server._save_confirmed_mask(sess, 0, mask0, push_undo=False)
+
+    # Classic engine preview on unconfirmed frame 4 -> 200, auto_tracked=True, not added to confirmed_masks
+    r_cls = client.post(
+        f"/matting/api/session/{sid}/preview",
+        json={"frame_idx": 4, "matting_engine": "classic"},
+    )
+    assert r_cls.status_code == 200, r_cls.text
+    d_cls = r_cls.json()
+    assert d_cls["auto_tracked"] is True
+    assert d_cls["left_b64"].startswith("data:image/jpeg;base64,")
+    assert d_cls["right_b64"].startswith("data:image/jpeg;base64,")
+    assert 4 not in sess.confirmed_masks
+
+    # Mock BiRefNet returning frame 4 subject + decoy blob to test disambiguation + slider reactivity
+    sess.preview_auto_cache.clear()
+    biref_calls = {"n": 0}
+
+    def _fake_birefnet(bgr, max_size=768):
+        biref_calls["n"] += 1
+        a = np.zeros((160, 160), dtype=np.float32)
+        # Moving subject at frame 4 (x0 = 52..102) matching reference color
+        a[35:125, 52:102] = 0.98
+        return a
+
+    monkeypatch.setattr(studio_server, "run_birefnet_matting", _fake_birefnet)
+
+    base_payload = {
+        "frame_idx": 4,
+        "matting_engine": "matanyone2",
+        "ambient_color_strength": 0.0,
+        "bg_defocus": 0.0,
+        "erode_dilate": 0.0,
+    }
+    r1 = client.post(f"/matting/api/session/{sid}/preview", json=base_payload)
+    assert r1.status_code == 200, r1.text
+    d1 = r1.json()
+    assert d1["auto_tracked"] is True
+    assert biref_calls["n"] == 1
+    assert 4 not in sess.confirmed_masks
+
+    # Slider change on unconfirmed frame 4 hits cache & visibly updates right_b64
+    r2 = client.post(
+        f"/matting/api/session/{sid}/preview",
+        json={
+            "frame_idx": 4,
+            "matting_engine": "matanyone2",
+            "ambient_color_strength": 1.0,
+            "bg_defocus": 10.0,
+            "erode_dilate": 3.0,
+        },
+    )
+    assert r2.status_code == 200, r2.text
+    d2 = r2.json()
+    assert d2["auto_tracked"] is True
+    assert biref_calls["n"] == 1
+
+    def _decode_b64_img(uri: str) -> np.ndarray:
+        raw = base64.b64decode(uri.split(",", 1)[1])
+        return cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+
+    img1 = _decode_b64_img(d1["right_b64"])
+    img2 = _decode_b64_img(d2["right_b64"])
+    assert float(np.mean(np.abs(img1.astype(np.float32) - img2.astype(np.float32)))) > 1.0

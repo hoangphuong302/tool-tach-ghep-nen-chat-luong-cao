@@ -13,7 +13,10 @@ from src.matte_qa import (
     audit_and_heal_video_mattes,
     heal_device_bezel_notches,
     heal_universal_structural_defects,
+    is_green_screen_scene,
 )
+from src.neural_matting import estimate_foreground_pymatting
+from src.segmentation import _fill_mask_holes
 
 
 def test_heal_device_bezel_notches_repairs_volume_rocker_bite() -> None:
@@ -237,3 +240,73 @@ def test_universal_optical_prompt_handles_person_reading_book_without_device_jar
     assert "morphing" not in v2v
     assert "máy phiên dịch" not in v2v
     assert "library" in prompts["clean_plate_prompt"].lower()
+
+
+def test_universal_hole_guard_preserves_bg_gap_and_cleans_green_slit() -> None:
+    # 1) Green-screen scene: hand + device + shadowed green slit between finger & device + body pinhole + screen green icon
+    h, w = 240, 240
+    bgr = np.full((h, w, 3), (45, 175, 42), dtype=np.uint8)  # chroma green background
+    alpha = np.zeros((h, w), dtype=np.float32)
+
+    # Dark handheld chassis + blue emissive screen
+    bgr[35:200, 65:165] = (24, 24, 28)
+    bgr[50:175, 76:154] = (145, 55, 25)
+    alpha[35:200, 65:165] = 1.0
+
+    # Small green UI button INSIDE emissive screen must be protected
+    bgr[125:140, 108:124] = (55, 215, 65)
+
+    # Interior dark pinhole in lower bezel body (not green, not BG-colored) -> should heal
+    alpha[183:192, 108:122] = 0.0
+
+    # Thumb + palm gripping around right side, creating a trapped shadowed green slit between finger & bezel
+    bgr[130:230, 165:205] = (120, 155, 210)
+    bgr[195:235, 95:195] = (120, 155, 210)
+    alpha[130:230, 165:205] = 1.0
+    alpha[195:235, 95:195] = 1.0
+
+    # Shadowed green slit at x=[156..167], y=[135..185] where BiRefNet mistakenly left alpha=0.90
+    bgr[135:185, 156:167] = (42, 86, 44)
+    alpha[135:185, 156:167] = 0.90
+
+    assert is_green_screen_scene(bgr, alpha) is True
+    healed, _, _ = heal_universal_structural_defects(bgr, alpha)
+    assert float(np.mean(healed[142:178, 158:165])) < 0.15  # trapped shadowed green crevice punched out
+    assert float(np.mean(healed[184:191, 110:120])) > 0.70  # interior device body pinhole healed
+    assert float(np.mean(healed[127:138, 110:122])) > 0.85  # green UI dot inside emissive screen preserved
+
+    # 2) Non-green room background (warm beige wall) with arm/coat loop enclosing small beige wall gap
+    h2, w2 = 200, 200
+    bgr_room = np.full((h2, w2, 3), (185, 200, 215), dtype=np.uint8)
+    mask_room = np.zeros((h2, w2), dtype=np.uint8)
+    bgr_room[30:170, 40:160] = (48, 44, 42)  # dark coat/book loop
+    mask_room[30:170, 40:160] = 1
+    # Small enclosed beige room wall gap (e.g. between elbow and torso)
+    bgr_room[85:105, 88:104] = (185, 200, 215)
+    mask_room[85:105, 88:104] = 0
+    # True foreground-colored missing pinhole spot on coat (6x6 = 36 px <= max_hole_area 48)
+    mask_room[126:132, 90:96] = 0
+
+    assert is_green_screen_scene(bgr_room, mask_room.astype(np.float32)) is False
+    healed_room, _, _ = heal_universal_structural_defects(bgr_room, mask_room.astype(np.float32))
+    assert float(np.mean(healed_room[88:102, 91:101])) < 0.10
+    assert float(np.mean(healed_room[126:132, 90:96])) > 0.70
+
+    filled_mask = _fill_mask_holes(mask_room, bgr=bgr_room)
+    assert int(np.sum(filled_mask[88:102, 91:101])) == 0
+    assert float(np.mean(filled_mask[126:132, 90:96])) == 1.0
+
+
+def test_pymatting_fast_preview_preserves_core() -> None:
+    bgr = np.full((240, 240, 3), (45, 175, 42), dtype=np.uint8)
+    bgr[60:180, 60:180] = (90, 120, 190)
+    alpha = np.zeros((240, 240), dtype=np.float32)
+    alpha[60:180, 60:180] = 1.0
+    alpha[59:181, 59] = 0.5
+    alpha[59:181, 180] = 0.5
+
+    out = estimate_foreground_pymatting(bgr, alpha, strength=0.8, despill_green=True, fast_preview=True)
+    assert out.dtype == np.uint8 and out.shape == bgr.shape
+    core = alpha >= 0.996
+    # Wait: core has despill check disabled on pure opaque interior (edge_weight is 0 when alpha >= 0.995)
+    assert np.array_equal(out[core], bgr[core])
