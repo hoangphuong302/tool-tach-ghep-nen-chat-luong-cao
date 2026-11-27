@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import tempfile
@@ -7,13 +8,26 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import cv2
 import imageio_ffmpeg
 import numpy as np
 
 _NVENC_CHECKED: Optional[bool] = None
+
+
+def _hidden_subprocess_kwargs() -> Dict[str, Any]:
+    """Hide child console windows (e.g. ffmpeg.exe) on Windows so no black cmd window flashes."""
+    if os.name != "nt":
+        return {}
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = subprocess.SW_HIDE
+    return {
+        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+        "startupinfo": si,
+    }
 
 
 def _has_nvenc() -> bool:
@@ -47,6 +61,7 @@ def _has_nvenc() -> bool:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=8,
+            **_hidden_subprocess_kwargs(),
         )
         _NVENC_CHECKED = proc.returncode == 0
     except Exception:
@@ -212,7 +227,7 @@ def encode_video(
         str(out),
     ])
 
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, **_hidden_subprocess_kwargs())
     if proc.returncode != 0:
         raise RuntimeError(f"FFmpeg failed ({proc.returncode}):\n{proc.stderr[-1500:]}")
     return out
@@ -278,6 +293,7 @@ class VideoPipeEncoder:
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=self._stderr_file,
+            **_hidden_subprocess_kwargs(),
         )
 
     def write(self, bgr_frame: np.ndarray) -> None:

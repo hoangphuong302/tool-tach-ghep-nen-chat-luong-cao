@@ -612,19 +612,27 @@ def test_optical_prompt_measures_noise_sharpness_tone_and_orientation_on_green_s
         use_local_llm=False,
     )
     cp = prompts["clean_plate_prompt"].lower()
-    assert "iso" in cp and "k" in cp and "tilted" in cp and "softness" in cp
+    assert "iso" in cp and "k" in cp and "tilted" in cp and "unsharpness" in cp
 
 
 def test_stationary_camera_lock_and_prompt_regeneration_variations(tmp_path: Path, monkeypatch) -> None:
     """
-    Prompts MUST enforce strictly stationary camera (micro-breathing only, NEVER walking),
-    and regenerating prompts reuses the cached optical profile while producing fresh variations.
+    Prompts MUST enforce stationary standing camera with gentle handheld sway (NEVER walking,
+    NEVER tripod-frozen, NEVER cinematic/DSLR bokeh), Windows FFmpeg subprocesses MUST hide
+    console windows, and regenerating prompts reuses cached profile with fresh variations.
     """
+    import os
     from fastapi.testclient import TestClient
 
     import studio_server
+    from src.video_io import _hidden_subprocess_kwargs
 
-    # Even with fast foreground hand motion between frames, camera motion MUST stay locked stationary!
+    if os.name == "nt":
+        kw = _hidden_subprocess_kwargs()
+        assert kw.get("creationflags", 0) != 0
+        assert kw.get("startupinfo") is not None
+
+    # Even with fast foreground hand motion between frames, camera motion MUST stay stationary standing + gentle sway!
     h, w = 220, 160
     frames = []
     for k in range(3):
@@ -633,14 +641,19 @@ def test_stationary_camera_lock_and_prompt_regeneration_variations(tmp_path: Pat
         frames.append(img)
 
     profile = analyze_video_optical_profile(frames, sample_count=3, use_vision_ai=False)
-    assert "stationary" in profile["camera_motion_en"].lower()
-    assert "no walking" in profile["camera_motion_en"].lower()
+    assert "stationary standing camera" in profile["camera_motion_en"].lower()
+    assert "gentle handheld sway" in profile["camera_motion_en"].lower()
+    assert "strictly no walking" in profile["camera_motion_en"].lower()
     assert "walk/sway" not in profile["camera_motion_en"].lower()
 
     p0 = generate_matched_background_prompts(profile, "Sảnh sân bay quốc tế hiện đại", use_local_llm=False, variation_seed=0)
     p1 = generate_matched_background_prompts(profile, "Sảnh sân bay quốc tế hiện đại", use_local_llm=False, variation_seed=1)
-    assert "strictly stationary camera position" in p0["clean_plate_prompt"].lower()
-    assert "strictly no walking" in p0["clean_plate_prompt"].lower()
+    cp0 = p0["clean_plate_prompt"].lower()
+    assert "stationary standing camera with gentle handheld sway" in cp0
+    assert "strictly no walking" in cp0
+    assert "raw unedited everyday smartphone" in cp0
+    assert "no cinematic film look" in cp0
+    assert "no creamy portrait bokeh" in cp0
     assert "strictly no walking" in p0["v2v_prompt"].lower()
     assert p0["clean_plate_prompt"] != p1["clean_plate_prompt"]
 

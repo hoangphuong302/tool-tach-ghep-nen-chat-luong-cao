@@ -1024,7 +1024,7 @@
     }
   }
 
-  async function pollRenderJob(jobId) {
+  async function pollRenderJob(jobId, failCount = 0) {
     clearTimeout(state.renderTimer);
     try {
       const st = await apiJson(`/session/${state.sid}/render/${jobId}`);
@@ -1046,10 +1046,16 @@
         showToast(st.message || 'Render lỗi', 'err', 6000);
         return;
       }
-      state.renderTimer = setTimeout(() => pollRenderJob(jobId), 1200);
+      state.renderTimer = setTimeout(() => pollRenderJob(jobId, 0), 1200);
     } catch (err) {
+      if (err.status !== 404 && failCount < 15) {
+        const nextFail = failCount + 1;
+        $('renderStatusMsg').textContent = `Mạng chập chờn — đang tự kết nối lại (${nextFail}/15), máy chủ vẫn đang render...`;
+        state.renderTimer = setTimeout(() => pollRenderJob(jobId, nextFail), 2000);
+        return;
+      }
       $('btnRenderFinal').disabled = false;
-      showToast(`Lỗi kiểm tra tiến trình: ${err.message}`, 'err');
+      showToast(`Lỗi kiểm tra tiến trình: ${err.message}`, 'err', 6000);
     }
   }
 

@@ -546,9 +546,15 @@ def _run_sam2matting_tiny(src_frames, tracked_masks, confirmed_masks, output_dir
     manifest_path = stage / "segments.json"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
     progress(0.40, desc=f"SAM2Matting Tiny GPU: {len(manifest)} đoạn tối đa 32 frame...")
+    sub_kw = {}
+    if os.name == "nt":
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = subprocess.SW_HIDE
+        sub_kw = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000), "startupinfo": si}
     result = subprocess.run(
         [str(python), str(runner), "--segments-json", str(manifest_path), "--output-dir", str(output_dir / "alpha")],
-        capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
+        capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, **sub_kw,
     )
     if result.returncode:
         raise RuntimeError((result.stderr or result.stdout or "SAM2Matting Tiny thất bại.").strip()[-1200:])

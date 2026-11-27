@@ -16,20 +16,28 @@ LOCAL_ROUTER_KEY = "sk-00b59870f0cdb29e-od5qn5-26b35cc0"
 LOCAL_ROUTER_MODEL = "editvideo"
 
 STATIONARY_CAMERA_LOCK_VI = (
-    "KHÓA CỨNG CAMERA ĐỨNG IM 1 CHỖ: người quay đứng yên tại một vị trí cố định, "
-    "chỉ có dao động vi mô cực nhẹ tự nhiên của tay giữ máy (KHÔNG đi bộ, KHÔNG tiến/lùi, KHÔNG lia pan/tilt/zoom)."
+    "KHÓA CỨNG CAMERA ĐỨNG IM 1 CHỖ + ĐUNG ĐƯA TAY CẦM RẤT NHẸ: người quay đứng yên 1 vị trí cố định "
+    "(KHÔNG đi bộ, KHÔNG tiến/lùi, KHÔNG lia pan/tilt/zoom), nhưng có độ đung đưa & rung vi mô rất nhẹ nhàng "
+    "tự nhiên như đang cầm điện thoại bằng tay thật (không cứng đơ như đặt trên tripod)."
 )
 STATIONARY_CAMERA_LOCK_EN = (
-    "STRICTLY STATIONARY CAMERA POSITION: the camera operator is standing completely still in one fixed spot "
-    "with ONLY imperceptible organic handheld micro-breathing and tiny 1-2mm hand-stability tremor — "
-    "STRICTLY NO walking, NO stepping forward or backward, NO dolly/tracking movement, NO panning, NO tilting, NO orbiting, and NO zooming"
+    "STATIONARY STANDING CAMERA WITH GENTLE HANDHELD SWAY: the person holding the smartphone stands in one fixed spot "
+    "(STRICTLY NO walking, NO stepping forward or backward, NO dolly/tracking movement, NO panning, NO tilting, NO orbiting, NO zooming), "
+    "with a very gentle, slow natural handheld sway and subtle real-life hand micro-tremor as if holding a phone casually in hand while standing still — never frozen stiff like a tripod"
+)
+
+RAW_SMARTPHONE_REALISM_EN = (
+    "RAW UNEDITED EVERYDAY SMARTPHONE FOOTAGE LOOK: shot casually on an ordinary mid-range consumer phone camera with a small mobile sensor "
+    "(deep mobile depth of field where background objects remain mostly recognizable with only mild natural unsharpness and slight everyday phone video compression — "
+    "STRICTLY NO cinematic film look, NO DSLR/mirrorless camera look, NO creamy portrait bokeh, NO overly smooth denoised AI plastic surfaces, "
+    "NO studio commercial color grading, NO glowing HDR gloss)"
 )
 
 _BG_VARIATION_FLAVORS = (
     "",
-    "framed from a slightly cleaner architectural angle with deeper uncluttered mid-ground space and soft ambient depth",
-    "composed with warm architectural layering, soft window/ambient light falloff across surfaces, and calm distant background presence",
-    "captured with balanced negative space in the center frame, crisp real-world material textures in the mid-ground, and gentle distant depth",
+    "framed from a plain slightly angled everyday viewpoint with natural mid-ground depth and unpolished real-life clutter",
+    "captured with ordinary unedited indoor/daylight ambient falloff across everyday surfaces and realistic distance scale",
+    "showing an unremarkable candid everyday space with open center foreground space and natural unstyled background details",
 )
 
 
@@ -262,43 +270,43 @@ def _translate_bg_concept_Via_agy_router(
 
 
 def _offline_bg_translation(target_background_vi: str, variation_seed: int = 0) -> str:
-    """Deterministic fallback dictionary + variation builder when local LLM router is unreachable."""
+    """Deterministic everyday raw-smartphone scene builder (anti-cinematic, no DSLR bokeh buzzwords)."""
     t = target_background_vi.lower()
     presets = [
         (["thư viện", "library", "đọc sách", "sách", "reading"], [
-            "a quiet cozy library and sunlit reading room viewed from one fixed standing spot, with wooden bookshelves, books softly out of focus in the distance, and soft natural window light",
-            "a calm sunlit wood-paneled study library viewed from a stationary standing position, with rows of bookshelves receding softly in depth and warm daylight streaming across a distant reading table",
-            "a modern quiet bookstore reading lounge seen from a fixed spot, with warm timber shelving, gentle natural window illumination, and calm atmospheric depth",
+            "an ordinary real-world public library and reading room seen from one fixed standing spot, with plain wooden bookshelves filled with everyday books in the background and flat natural window daylight",
+            "a candid everyday bookstore and study room viewed from a stationary standing spot, showing rows of regular bookshelves, simple wooden tables, and ordinary ceiling/window room lighting",
+            "a quiet local library interior seen from a fixed standing position, with unstyled shelves, regular reading desks in the mid-ground, and plain natural daylight",
         ]),
         (["cà phê", "cafe", "coffee"], [
-            "a calm modern glass-walled specialty coffee shop in Tokyo viewed from one fixed standing spot, with warm wood textures, soft morning sunlight filtering through windows, and softly blurred seated patrons in the distance",
-            "an inviting minimalist cafe interior seen from a stationary point, featuring warm wooden counters, subtle hanging lamps, soft window daylight, and gentle depth across distant tables",
-            "a sunlit corner specialty coffee bar observed from a fixed standing position, with glass windows, soft indoor greenery, and quietly seated guests blurred softly in the background",
+            "an ordinary everyday neighborhood coffee shop interior seen from one fixed standing spot, with regular wooden tables, glass storefront windows, plain indoor lighting, and casual customers sitting further back",
+            "a candid casual cafe interior viewed from a stationary standing point, showing everyday counter equipment, plain wall tiles, regular chairs, and natural ungraded daylight from the window",
+            "a real-life street-level coffee shop observed from a fixed standing position, with simple wood tables, ordinary hanging bulbs, and people sitting naturally in the background",
         ]),
         (["sân bay", "airport", "check-in", "nhà ga"], [
-            "a bright, spacious international airport terminal departure hall viewed from a single fixed standing spot, with sleek modern architectural columns, glowing flight information boards, and softly blurred distant passengers in the far background",
-            "a clean modern airport check-in concourse seen from a stationary standing point, featuring high glass ceilings, calm check-in counters in the mid-ground, and subtle ambient terminal depth",
-            "an airy international airport boarding lounge observed from one fixed position, with floor-to-ceiling terminal windows, soft diffused architectural lighting, and distant seating areas softly out of focus",
+            "an ordinary real-world airport terminal check-in hall seen from one fixed standing spot, with plain tiled floors, everyday overhead terminal lights, departure screens, and casual travelers further back",
+            "a candid airport departure concourse viewed from a stationary standing position, showing standard check-in counters in the mid-ground, regular signage, and flat everyday indoor lighting",
+            "a regular international airport waiting hall observed from one fixed standing spot, with ordinary glass windows, plain metal seating rows, and everyday travelers in the distance",
         ]),
         (["khách sạn", "hotel", "sảnh", "lobby"], [
-            "a luxury 5-star hotel lobby viewed from one fixed standing spot, with polished marble floors, warm architectural cove lighting, minimalist indoor greenery, and soft ambient depth in the background",
-            "an elegant upscale hotel reception lounge seen from a stationary position, featuring warm stone columns, subtle pendant lighting, and calm spacious seating softly blurred in the distance",
+            "a real-world hotel lobby seen from one fixed standing spot, with plain stone floor tiles, regular reception desk in the distance, potted plants, and ordinary indoor ceiling lighting",
+            "an everyday hotel reception lounge viewed from a stationary standing point, with standard lobby chairs, neutral walls, and natural ungraded ambient light",
         ]),
         (["phố", "street", "tokyo", "châu âu", "đi bộ"], [
-            "an upscale city pedestrian boulevard observed from a single fixed standing spot on the sidewalk, with modern storefronts, leafy street trees, and calm architectural depth under natural daylight",
-            "a quiet sunlit European-style street corner viewed from a stationary standing position, with textured cafe facades, soft tree shade, and gentle urban depth in the distance",
+            "an ordinary real-world city sidewalk and storefront street observed from one fixed standing spot, with everyday shop signs, regular street trees, concrete pavement, and natural ungraded daylight",
+            "a candid everyday city street corner viewed from a stationary standing position on the pavement, with plain building facades, parked bicycles/signs, and ordinary outdoor daylight",
         ]),
         (["văn phòng", "office", "họp", "công sở"], [
-            "a sleek contemporary tech executive office and glass meeting lounge viewed from one fixed standing spot, with clean architectural lines, wooden desk surfaces, and soft natural window light",
-            "a calm modern studio workspace seen from a stationary standing position, with frosted glass partitions, subtle indoor plants, and soft daylight across the distant room",
+            "an ordinary everyday office workspace seen from one fixed standing spot, with plain desks, office chairs, glass partition walls, and standard indoor ceiling/window light",
+            "a candid real-world meeting room and office interior viewed from a stationary standing point, with regular desks, computer monitors further back, and flat everyday room lighting",
         ]),
         (["taxi", "xe hơi", "ô tô", "ghế sau"], [
-            "the calm parked rear cabin interior of a modern executive sedan observed from a fixed seated viewpoint, with soft natural daylight entering through the side windows and gently blurred city architecture outside",
-            "the quiet leather interior of a stationary modern car seen from a fixed passenger viewpoint, with clean dashboard/window framing and soft outdoor daylight outside the glass",
+            "the ordinary interior of a parked modern sedan rear seat observed from a fixed seated viewpoint, with plain car door trim, regular fabric/leather seats, and natural ungraded daylight through the side window",
+            "the candid everyday back-seat cabin of a stationary car seen from a fixed passenger viewpoint, with ordinary window glass and realistic unpolished street view outside",
         ]),
         (["linh kiện", "điện tử", "thâm quyến", "sửa chữa"], [
-            "a bustling Shenzhen electronics components counter viewed from a single fixed standing spot, with organized component bins, warm overhead shop lighting, and softly blurred shelves in the background",
-            "an authentic electronics repair and parts shop interior seen from a stationary standing position, with tidy workbench tools, warm ceiling lights, and softly out-of-focus component drawers behind",
+            "an ordinary real-world Shenzhen electronics components shop counter viewed from one fixed standing spot, with cluttered parts bins, plain fluorescent shop lighting, and regular shelves behind",
+            "a candid everyday electronics repair shop interior seen from a stationary standing position, with regular workbench tools, unstyled overhead lights, and component drawers in the background",
         ]),
     ]
     v_idx = max(0, int(variation_seed))
@@ -309,8 +317,8 @@ def _offline_bg_translation(target_background_vi: str, variation_seed: int = 0) 
             break
     if not base_desc:
         base_desc = (
-            f"a photorealistic real-world environment ({target_background_vi}) viewed from a single fixed standing spot, "
-            "with authentic architectural depth and physically accurate perspective"
+            f"an ordinary candid real-world environment ({target_background_vi}) viewed from a single fixed standing spot, "
+            "with plain everyday textures, natural unpolished lighting, and realistic perspective"
         )
     flavor = _BG_VARIATION_FLAVORS[v_idx % len(_BG_VARIATION_FLAVORS)]
     return f"{base_desc}, {flavor}" if flavor else base_desc
@@ -1030,12 +1038,14 @@ def _craft_matched_environment_via_llm(
 ) -> Optional[str]:
     v_seed = max(0, int(variation_seed))
     sys_msg = (
-        "You are an expert Cinematographer & VFX Compositing Supervisor. "
-        "Translate the user's Vietnamese background description into 2-3 crisp, photorealistic English sentences "
-        "describing ONLY the empty real-world environment and background props scaled accurately to match the camera telemetry. "
-        "CRITICAL CAMERA LOCK: The camera operator MUST stand completely still in one fixed spot with ONLY subtle imperceptible handheld micro-breathing — "
-        "STRICTLY FORBID walking, moving forward/backward, dolly, panning, tilting, or tracking camera shots. "
-        "Never include hands, phones, or foreground objects in the description. Output ONLY English prose."
+        "You are a candid real-world smartphone video supervisor (NOT a commercial cinema director). "
+        "Translate the user's Vietnamese background description into 2-3 plain, unglamorous, raw everyday English sentences "
+        "describing ONLY the empty real-world environment as captured casually on an ordinary mid-range smartphone. "
+        "CRITICAL CAMERA LOCK: The person holding the phone stands in one fixed spot with a very gentle, slow natural handheld sway — "
+        "STRICTLY FORBID walking, moving forward/backward, dolly, panning, tilting, or tracking shots. "
+        "ANTI-CINEMATIC RULE: STRICTLY FORBID words like 'cinematic', 'luxury', 'sleek', 'sophisticated', 'dreamy', 'creamy bokeh', "
+        "'softly blurred', 'shallow depth of field', 'dramatic lighting', or 'glossy'. Keep it ordinary, real, and unpolished. "
+        "Never include hands, phones, or foreground objects. Output ONLY English prose."
     )
     var_note = (
         f"Variation #{v_seed + 1}: craft a fresh alternative camera framing/composition and subtle background layout for this location while keeping the camera 100% stationary in one fixed spot."
@@ -1118,29 +1128,32 @@ def generate_matched_background_prompts(
     dist_focus = profile.get("subject_distance_label") or f"~{profile['subject_distance_cm']}cm"
 
     clean_plate_prompt = (
-        f"Photorealistic clean empty background plate video in {profile['aspect_ratio_en']}, "
+        f"Raw unedited everyday smartphone background video in {profile['aspect_ratio_en']}, "
         f"{profile['scale_calibration_en']}. "
-        f"Camera Motion Lock: {STATIONARY_CAMERA_LOCK_EN}. "
-        f"Depict {ai_bg_en}, with a completely open, unobstructed empty foreground (strictly NO people, NO hands, NO held objects in the center foreground plane). "
+        f"{RAW_SMARTPHONE_REALISM_EN}. "
+        f"Camera Motion: {STATIONARY_CAMERA_LOCK_EN}. "
+        f"Scene: {ai_bg_en}, with a completely empty, unobstructed foreground (strictly NO people, NO hands, NO held objects in the center foreground). "
         f"Scale & Framing: {scale_en} "
-        f"Lighting, Color & Tone: match {profile['lighting_en']} with {color_tone_en}, {hard_en}, {shadow_en}, and {exp_en} so foreground subjects composite seamlessly with minimal color grading. "
-        f"Optics, Sharpness & Sensor Noise: {profile['focal_length_mm']}mm {aperture_est} focused around {dist_focus}, {sharp_en}, background sitting at ~{bg_blur}px gentle optical softness with {noise_en} (strictly NO glossy CGI or synthetic AI hyper-sharpness). Keep the camera locked stationary in one spot with only tiny natural breathing and strict temporal stability."
+        f"Ungraded Lighting, Color & Tone: match {profile['lighting_en']} with {color_tone_en}, {hard_en}, {shadow_en}, and {exp_en} using ordinary unedited smartphone auto-exposure and auto white balance so real phone footage composites seamlessly. "
+        f"Everyday Phone Optics, Sharpness & Noise: small consumer phone sensor ({profile['focal_length_mm']}mm, deep natural phone DoF — NOT DSLR f/1.4 bokeh, background stays recognizable with only mild ~{bg_blur}px everyday lens unsharpness), matching {sharp_en} and {noise_en} with authentic mobile H.264 video texture and strict frame-to-frame stability."
     )
 
     v2v_prompt = (
-        f"Video-to-video background replacement in {profile['aspect_ratio_en']}, {profile['scale_calibration_en']}. "
+        f"Raw everyday smartphone video-to-video background replacement in {profile['aspect_ratio_en']}, {profile['scale_calibration_en']}. "
+        f"{RAW_SMARTPHONE_REALISM_EN}. "
         f"KEEP {subj_en} 100% intact with identical silhouette, details, surface texture, and original motion. "
-        f"Camera Motion Lock: {STATIONARY_CAMERA_LOCK_EN}. "
+        f"Camera Motion: {STATIONARY_CAMERA_LOCK_EN}. "
         f"CHANGE only the environment behind the foreground into {ai_bg_en}, strictly obeying the perspective rule: {scale_en} "
-        f"Match illumination and grading with {profile['lighting_en']}, {color_tone_en}, {hard_en}, {shadow_en}, {exp_en}. "
-        f"Render background optics at {aperture_est} (~{bg_blur}px natural softness) matching {sharp_en} and {noise_en}, with strict temporal frame-to-frame stability and zero camera drift or walking."
+        f"Match plain ungraded lighting and color with {profile['lighting_en']}, {color_tone_en}, {hard_en}, {shadow_en}, {exp_en}. "
+        f"Render background with ordinary small-sensor phone optics (deep natural focus, only mild ~{bg_blur}px optical unsharpness — NO creamy DSLR bokeh or smooth AI sheen), matching {sharp_en} and {noise_en}, with strict temporal frame-to-frame stability."
     )
 
     still_bg_prompt = (
-        f"Authentic candid photograph of an empty background scene in {profile['aspect_ratio_en']}, "
-        f"{profile['scale_calibration_en']}. Scene: {ai_bg_en}, completely unobstructed empty foreground (no subject blocking center foreground), viewed from a single fixed standing spot. "
+        f"Raw unedited candid smartphone photo of an empty everyday background scene in {profile['aspect_ratio_en']}, "
+        f"{profile['scale_calibration_en']}. {RAW_SMARTPHONE_REALISM_EN}. "
+        f"Scene: {ai_bg_en}, completely unobstructed empty foreground, viewed from a single fixed standing spot. "
         f"{scale_en} Illuminated by {profile['lighting_en']} with {color_tone_en}, {hard_en}, {shadow_en}, and {exp_en}. "
-        f"Captured at {profile['focal_length_mm']}mm {aperture_est} focused at {dist_focus} with {sharp_en}, ~{bg_blur}px gentle background softness, and {noise_en}."
+        f"Captured casually on a mid-range {profile['focal_length_mm']}mm smartphone camera (deep natural mobile focus, only mild ~{bg_blur}px optical unsharpness — NO DSLR portrait blur), matching {sharp_en} and {noise_en}."
     )
 
     full_markdown = (
