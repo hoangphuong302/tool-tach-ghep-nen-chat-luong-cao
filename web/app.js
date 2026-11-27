@@ -45,6 +45,8 @@
     lastAutoTracked: false,
     spaceDown: false,
     renderTimer: null,
+    promptVarSeed: 0,
+    hasAnalyzedPrompts: false,
   };
 
   // Offscreen stroke layer (at full source resolution once loaded)
@@ -237,6 +239,9 @@
         $('renderJobBox').hidden = true;
         $('sampledThumbs').innerHTML = '';
         $('telemetryGrid').innerHTML = '';
+        state.promptVarSeed = 0;
+        state.hasAnalyzedPrompts = false;
+        if ($('promptVarBadge')) $('promptVarBadge').textContent = 'Mẫu #1';
         drawCompCanvas();
         await loadCutFrame(0);
         showToast(`Đã nạp ${comp.filename} (${comp.width}×${comp.height}, ${comp.frame_count} frames)`, 'ok');
@@ -597,13 +602,24 @@
   }
 
   // ------------------------------------------------------------------
-  // Step 2: Optical Multi-Frame Prompt Analyzer
+  // Step 2: Optical Multi-Frame Prompt Analyzer & Regenerator
   // ------------------------------------------------------------------
-  async function analyzeAndGeneratePrompts() {
+  async function analyzeAndGeneratePrompts(opts = {}) {
     if (!state.sid || !state.srcMeta) return showToast('Hãy tải Video hoặc Ảnh gốc ở Bước 1 trước.', 'err');
-    const btn = $('btnAnalyzePrompts');
-    btn.disabled = true;
-    btn.textContent = '⏳ Đang phân tích quang học...';
+    const regenerate = Boolean(opts.regenerate);
+    const forceReanalyze = Boolean(opts.forceReanalyze);
+    const nextSeed = regenerate ? (state.promptVarSeed + 1) : 0;
+
+    const btnMain = $('btnAnalyzePrompts');
+    const btnRegen = $('btnRegeneratePrompts');
+    if (btnMain) {
+      btnMain.disabled = true;
+      if (!regenerate) btnMain.textContent = '⏳ Đang phân tích quang học...';
+    }
+    if (btnRegen) {
+      btnRegen.disabled = true;
+      btnRegen.textContent = '⏳ Đang tạo mẫu mới...';
+    }
     try {
       const res = await apiJson(`/session/${state.sid}/analyze-prompts`, {
         method: 'POST',
@@ -613,8 +629,14 @@
           subject_description_vi: $('subjectDescText').value,
           use_local_llm: $('chkLocalLlm').checked,
           use_vision_ai: $('chkVisionAi').checked,
+          variation_seed: nextSeed,
+          force_reanalyze: forceReanalyze,
         }),
       });
+
+      state.promptVarSeed = Number(res.variation_seed ?? nextSeed);
+      state.hasAnalyzedPrompts = true;
+      if ($('promptVarBadge')) $('promptVarBadge').textContent = `Mẫu #${state.promptVarSeed + 1}`;
 
       const strip = $('sampledThumbs');
       strip.innerHTML = '';
@@ -649,12 +671,19 @@
       $('outCleanPrompt').value = res.clean_plate_prompt || '';
       $('outV2vPrompt').value = res.v2v_prompt || '';
       $('outStillPrompt').value = res.still_bg_prompt || '';
-      showToast('Đã phân tích quang học và tạo 3 Prompt chuẩn phối cảnh!', 'ok');
+      const modeTag = res.reused_profile ? ` (Mẫu #${state.promptVarSeed + 1} · giữ nguyên thông số quang học)` : '';
+      showToast(`Đã tạo 3 Prompt khóa camera đứng im chuẩn phối cảnh${modeTag}!`, 'ok');
     } catch (err) {
       showToast(`Lỗi phân tích Prompt: ${err.message}`, 'err', 5000);
     } finally {
-      btn.disabled = false;
-      btn.textContent = '🔍 Phân tích Frame & Tạo Prompt';
+      if (btnMain) {
+        btnMain.disabled = false;
+        btnMain.textContent = '🔍 Phân tích Frame & Tạo Prompt';
+      }
+      if (btnRegen) {
+        btnRegen.disabled = false;
+        btnRegen.textContent = '🔄 Tạo lại Prompt';
+      }
     }
   }
 
@@ -1228,9 +1257,16 @@
     $('btnGoComposite').addEventListener('click', () => switchStep('composite'));
 
     // Step 2
-    $('btnAnalyzePrompts').addEventListener('click', analyzeAndGeneratePrompts);
+    $('btnAnalyzePrompts').addEventListener('click', () => analyzeAndGeneratePrompts({ regenerate: false, forceReanalyze: true }));
+    $('btnRegeneratePrompts')?.addEventListener('click', () => analyzeAndGeneratePrompts({ regenerate: true, forceReanalyze: false }));
     document.querySelectorAll('#bgPresets .chip').forEach((c) => {
-      c.addEventListener('click', () => { $('targetBgText').value = c.dataset.bg; });
+      c.addEventListener('click', () => {
+        document.querySelectorAll('#bgPresets .chip').forEach((x) => x.classList.toggle('active', x === c));
+        $('targetBgText').value = c.dataset.bg;
+        if (state.sid && state.srcMeta && state.hasAnalyzedPrompts) {
+          analyzeAndGeneratePrompts({ regenerate: true, forceReanalyze: false });
+        }
+      });
     });
     document.querySelectorAll('.copy-btn').forEach((btn) => {
       btn.addEventListener('click', async () => {

@@ -178,6 +178,7 @@ class SessionState:
     bg_cache: OrderedDict = field(default_factory=OrderedDict)
     comp_cache: OrderedDict = field(default_factory=OrderedDict)
     preview_auto_cache: OrderedDict = field(default_factory=OrderedDict)
+    optical_profile_cache: Optional[Tuple[Tuple[object, ...], Dict[str, Any]]] = None
 
     def touch(self) -> None:
         self.last_active = time.time()
@@ -325,6 +326,8 @@ class AnalyzePromptsReq(BaseModel):
     subject_description_vi: str = ""
     use_local_llm: bool = True
     use_vision_ai: bool = True
+    variation_seed: int = 0
+    force_reanalyze: bool = False
 
 
 class PreviewReq(BaseModel):
@@ -407,6 +410,7 @@ def _save_confirmed_mask(sess: SessionState, f_idx: int, mask: np.ndarray, push_
     sess.matte_cache.clear()
     sess.comp_cache.clear()
     sess.preview_auto_cache.clear()
+    sess.optical_profile_cache = None
     return out_p
 
 
@@ -1277,6 +1281,8 @@ def upload_complete(sid: str, uid: str):
             sess.tracked_masks = []
             sess.matte_cache.clear()
             sess.comp_cache.clear()
+            sess.preview_auto_cache.clear()
+            sess.optical_profile_cache = None
     else:
         with sess.lock:
             if sess.bg_media and Path(sess.bg_media).exists():
@@ -1464,6 +1470,7 @@ def reset_mask(sid: str, req: FrameActionReq):
         sess.matte_cache.clear()
         sess.comp_cache.clear()
         sess.preview_auto_cache.clear()
+        sess.optical_profile_cache = None
         return {"ok": True, "confirmed_frames": sorted(sess.confirmed_masks.keys()), "disk_mb": _dir_size_mb(sess.work_dir)}
 
 
@@ -1475,13 +1482,27 @@ def analyze_prompts(sid: str, req: AnalyzePromptsReq):
             raise HTTPException(status_code=400, detail="Chưa tải video/ảnh gốc lên để phân tích.")
         frames = list(sess.src_frames)
         masks = [_load_session_frame_mask(sess, i) for i in range(len(frames))]
+        mask_sig = tuple(
+            (k, p.stat().st_mtime_ns) for k, p in sorted(sess.confirmed_masks.items()) if p.is_file()
+        )
+        prof_key: Tuple[object, ...] = (len(frames), str(frames[0]), mask_sig, bool(req.use_vision_ai))
+        cached_prof = sess.optical_profile_cache
 
-    profile = analyze_video_optical_profile(frames, fg_masks=masks, sample_count=4, use_vision_ai=bool(req.use_vision_ai))
+    reused_profile = False
+    if not req.force_reanalyze and cached_prof is not None and cached_prof[0] == prof_key:
+        profile = cached_prof[1]
+        reused_profile = True
+    else:
+        profile = analyze_video_optical_profile(frames, fg_masks=masks, sample_count=4, use_vision_ai=bool(req.use_vision_ai))
+        with sess.lock:
+            sess.optical_profile_cache = (prof_key, profile)
+
     prompts = generate_matched_background_prompts(
         profile,
         target_background_vi=req.target_background_vi,
         subject_description_vi=req.subject_description_vi,
         use_local_llm=bool(req.use_local_llm),
+        variation_seed=int(max(0, req.variation_seed)),
     )
     sampled_urls = [
         f"api/session/{sid}/frame/{i}?view=raw&max_dim=480"
@@ -1491,6 +1512,8 @@ def analyze_prompts(sid: str, req: AnalyzePromptsReq):
         "ok": True,
         "sampled_indices": profile.get("sampled_indices", [0]),
         "sampled_urls": sampled_urls,
+        "variation_seed": int(prompts.get("variation_seed", req.variation_seed)),
+        "reused_profile": reused_profile,
         "telemetry_cards": prompts["telemetry_cards"],
         "clean_plate_prompt": prompts["clean_plate_prompt"],
         "v2v_prompt": prompts["v2v_prompt"],

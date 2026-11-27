@@ -613,3 +613,64 @@ def test_optical_prompt_measures_noise_sharpness_tone_and_orientation_on_green_s
     )
     cp = prompts["clean_plate_prompt"].lower()
     assert "iso" in cp and "k" in cp and "tilted" in cp and "softness" in cp
+
+
+def test_stationary_camera_lock_and_prompt_regeneration_variations(tmp_path: Path, monkeypatch) -> None:
+    """
+    Prompts MUST enforce strictly stationary camera (micro-breathing only, NEVER walking),
+    and regenerating prompts reuses the cached optical profile while producing fresh variations.
+    """
+    from fastapi.testclient import TestClient
+
+    import studio_server
+
+    # Even with fast foreground hand motion between frames, camera motion MUST stay locked stationary!
+    h, w = 220, 160
+    frames = []
+    for k in range(3):
+        img = np.full((h, w, 3), (45, 175, 42), dtype=np.uint8)
+        cv2.rectangle(img, (25 + k * 24, 60), (95 + k * 24, 180), (120, 155, 210), -1)
+        frames.append(img)
+
+    profile = analyze_video_optical_profile(frames, sample_count=3, use_vision_ai=False)
+    assert "stationary" in profile["camera_motion_en"].lower()
+    assert "no walking" in profile["camera_motion_en"].lower()
+    assert "walk/sway" not in profile["camera_motion_en"].lower()
+
+    p0 = generate_matched_background_prompts(profile, "Sảnh sân bay quốc tế hiện đại", use_local_llm=False, variation_seed=0)
+    p1 = generate_matched_background_prompts(profile, "Sảnh sân bay quốc tế hiện đại", use_local_llm=False, variation_seed=1)
+    assert "strictly stationary camera position" in p0["clean_plate_prompt"].lower()
+    assert "strictly no walking" in p0["clean_plate_prompt"].lower()
+    assert "strictly no walking" in p0["v2v_prompt"].lower()
+    assert p0["clean_plate_prompt"] != p1["clean_plate_prompt"]
+
+    # Studio server endpoint: first call analyzes, regenerate call reuses cached profile & changes prompt
+    store = studio_server.SessionStore(base_dir=tmp_path / "sessions", ttl_seconds=600)
+    monkeypatch.setattr(studio_server, "STORE", store)
+    client = TestClient(studio_server.app)
+    sid = client.post("/matting/api/session").json()["session_id"]
+
+    _, buf = cv2.imencode(".png", frames[0])
+    ui = client.post(f"/matting/api/session/{sid}/upload/init", json={"role": "source", "filename": "f.png", "total_size": len(buf)})
+    uid = ui.json()["upload_id"]
+    client.put(f"/matting/api/session/{sid}/upload/{uid}/chunk?index=0", content=buf.tobytes())
+    client.post(f"/matting/api/session/{sid}/upload/{uid}/complete")
+
+    r1 = client.post(
+        f"/matting/api/session/{sid}/analyze-prompts",
+        json={"target_background_vi": "Quán cà phê kính hiện đại", "use_local_llm": False, "use_vision_ai": False, "variation_seed": 0, "force_reanalyze": True},
+    )
+    assert r1.status_code == 200
+    j1 = r1.json()
+    assert j1["reused_profile"] is False
+    assert "strictly no walking" in j1["clean_plate_prompt"].lower()
+
+    r2 = client.post(
+        f"/matting/api/session/{sid}/analyze-prompts",
+        json={"target_background_vi": "Quán cà phê kính hiện đại", "use_local_llm": False, "use_vision_ai": False, "variation_seed": 1, "force_reanalyze": False},
+    )
+    assert r2.status_code == 200
+    j2 = r2.json()
+    assert j2["reused_profile"] is True
+    assert j2["variation_seed"] == 1
+    assert j2["clean_plate_prompt"] != j1["clean_plate_prompt"]

@@ -619,7 +619,7 @@ textarea { resize: vertical; line-height: 1.45; }
   font-weight: 600;
   cursor: pointer;
 }
-.chip:hover { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+.chip:hover, .chip.active { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
 
 .prompt-inputs-grid {
   display: grid;

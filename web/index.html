@@ -198,17 +198,23 @@
 
         <div class="card">
           <div class="card-head">
-            <h4>Ý Tưởng Bối Cảnh Mới</h4>
-            <span class="small-note">Chọn nhanh gợi ý hoặc nhập bối cảnh bạn muốn đổi sang</span>
+            <div>
+              <h4>Ý Tưởng Bối Cảnh Mới</h4>
+              <span class="small-note">Chọn nhanh gợi ý hoặc sửa mô tả rồi bấm "Tạo lại Prompt" để đổi mẫu ngay (tự khóa camera đứng im 1 chỗ)</span>
+            </div>
+            <div class="tool-group">
+              <span id="promptVarBadge" class="badge">Mẫu #1</span>
+              <button type="button" id="btnRegeneratePrompts" class="btn btn-primary btn-sm" title="Tạo lại bộ Prompt mới theo bối cảnh đang chọn mà không cần quét lại frame">🔄 Tạo lại Prompt</button>
+            </div>
           </div>
           <div class="chip-row" id="bgPresets">
             <button type="button" class="chip" data-bg="Phòng đọc sách / thư viện ấm áp có kệ sách gỗ mờ nhẹ ở xa, ánh sáng tự nhiên qua cửa sổ">📚 Thư Viện / Đọc Sách</button>
-            <button type="button" class="chip" data-bg="Sảnh sân bay quốc tế hiện đại, không gian rộng thoáng, ánh sáng ban ngày tự nhiên, hành khách kéo vali ở xa">✈️ Sảnh Sân Bay</button>
+            <button type="button" class="chip" data-bg="Sảnh sân bay quốc tế hiện đại, không gian rộng thoáng, ánh sáng ban ngày tự nhiên, đứng yên 1 chỗ nhìn về quầy check-in phía xa">✈️ Sảnh Sân Bay</button>
             <button type="button" class="chip" data-bg="Quầy bán linh kiện và sửa chữa điện tử sầm uất ở Thâm Quyến, bàn nhiều linh kiện nhỏ và đèn trần ấm tự nhiên">🔌 Chợ Điện Tử</button>
             <button type="button" class="chip" data-bg="Quán cà phê kính hiện đại tại Tokyo, ánh nắng dịu buổi sáng qua cửa kính, bàn gỗ và khách ngồi mờ nhẹ phía xa">☕ Cafe Tokyo</button>
             <button type="button" class="chip" data-bg="Sảnh khách sạn 5 sao sang trọng, sàn đá marble phản chiếu nhẹ và đèn trần ấm tự nhiên">🏨 Khách Sạn 5 Sao</button>
-            <button type="button" class="chip" data-bg="Phố đi bộ hiện đại ban ngày, hàng cây và cửa hàng phía sau có người đi bộ ở xa">🚶 Phố Đi Bộ</button>
-            <button type="button" class="chip" data-bg="Hàng ghế sau ô tô / taxi hiện đại đang di chuyển trên phố ban ngày, ánh sáng tự nhiên qua kính cửa sổ">🚕 Ghế Sau Taxi</button>
+            <button type="button" class="chip" data-bg="Góc phố đi bộ hiện đại ban ngày nhìn từ một điểm đứng cố định trên vỉa hè, hàng cây và cửa hàng phía sau có chiều sâu tự nhiên">🏙️ Góc Phố Ban Ngày</button>
+            <button type="button" class="chip" data-bg="Khoang ghế sau ô tô hiện đại đang đỗ yên tĩnh trên phố ban ngày, ánh sáng tự nhiên dịu qua kính cửa sổ">🚗 Khoang Xe Yên Tĩnh</button>
           </div>
           <div class="prompt-inputs-grid">
             <label class="field">

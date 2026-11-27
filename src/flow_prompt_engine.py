@@ -15,6 +15,23 @@ LOCAL_ROUTER_URL = "http://127.0.0.1:20128/v1/chat/completions"
 LOCAL_ROUTER_KEY = "sk-00b59870f0cdb29e-od5qn5-26b35cc0"
 LOCAL_ROUTER_MODEL = "editvideo"
 
+STATIONARY_CAMERA_LOCK_VI = (
+    "KHÓA CỨNG CAMERA ĐỨNG IM 1 CHỖ: người quay đứng yên tại một vị trí cố định, "
+    "chỉ có dao động vi mô cực nhẹ tự nhiên của tay giữ máy (KHÔNG đi bộ, KHÔNG tiến/lùi, KHÔNG lia pan/tilt/zoom)."
+)
+STATIONARY_CAMERA_LOCK_EN = (
+    "STRICTLY STATIONARY CAMERA POSITION: the camera operator is standing completely still in one fixed spot "
+    "with ONLY imperceptible organic handheld micro-breathing and tiny 1-2mm hand-stability tremor — "
+    "STRICTLY NO walking, NO stepping forward or backward, NO dolly/tracking movement, NO panning, NO tilting, NO orbiting, and NO zooming"
+)
+
+_BG_VARIATION_FLAVORS = (
+    "",
+    "framed from a slightly cleaner architectural angle with deeper uncluttered mid-ground space and soft ambient depth",
+    "composed with warm architectural layering, soft window/ambient light falloff across surfaces, and calm distant background presence",
+    "captured with balanced negative space in the center frame, crisp real-world material textures in the mid-ground, and gentle distant depth",
+)
+
 
 def analyze_scene_telemetry(
     bgr: np.ndarray,
@@ -205,7 +222,9 @@ def _translate_bg_concept_Via_agy_router(
         "You are an expert Cinematographer and Google Flow (Omni 1.2 / Veo) Prompt Architect. "
         "Translate and expand the user's Vietnamese background concept into a concise, photorealistic "
         "2-sentence English environment description that strictly matches the provided camera angle, "
-        "lighting direction, and depth-of-field bokeh. Output ONLY the English environment sentences, no markdown."
+        "lighting direction, and depth-of-field bokeh. CRITICAL: The camera MUST remain strictly stationary "
+        "in one fixed standing spot (NEVER walking, NEVER dolly/moving forward, NEVER panning/tilting). "
+        "Output ONLY the English environment sentences, no markdown."
     )
     user_msg = (
         f"Vietnamese Background Idea: {target_background_vi}\n"
@@ -242,25 +261,59 @@ def _translate_bg_concept_Via_agy_router(
     return None
 
 
-def _offline_bg_translation(target_background_vi: str) -> str:
-    """Deterministic fallback dictionary + builder when local LLM router is unreachable."""
+def _offline_bg_translation(target_background_vi: str, variation_seed: int = 0) -> str:
+    """Deterministic fallback dictionary + variation builder when local LLM router is unreachable."""
     t = target_background_vi.lower()
     presets = [
-        (["thư viện", "library", "đọc sách", "sách", "reading"], "a warm cozy library and sunlit reading room with wooden bookshelves, books softly out of focus in the distance, and soft natural window light"),
-        (["cà phê", "cafe", "coffee"], "a sophisticated modern glass-walled specialty coffee shop in Tokyo with warm wood textures, soft morning sunlight filtering through floor-to-ceiling windows, and gently blurred patrons in the distance"),
-        (["sân bay", "airport", "check-in", "nhà ga"], "a bright, spacious international airport terminal departure hall with sleek modern architectural columns, glowing flight information boards, and softly blurred travelers with luggage walking in the background"),
-        (["khách sạn", "hotel", "sảnh", "lobby"], "a luxury 5-star hotel lobby with polished marble floors, warm architectural cove lighting, minimalist indoor greenery, and soft ambient depth in the background"),
-        (["phố", "street", "tokyo", "châu âu", "đi bộ"], "a vibrant upscale pedestrian boulevard with modern storefronts, trees, and gently out-of-focus pedestrians strolling under natural daylight"),
-        (["văn phòng", "office", "họp", "công sở"], "a sleek contemporary tech executive office and glass meeting lounge with clean architectural lines and soft natural window light"),
-        (["taxi", "xe hơi", "ô tô", "ghế sau"], "the comfortable rear cabin of a modern executive taxi moving smoothly through a city avenue, with natural daylight entering through the side windows"),
+        (["thư viện", "library", "đọc sách", "sách", "reading"], [
+            "a quiet cozy library and sunlit reading room viewed from one fixed standing spot, with wooden bookshelves, books softly out of focus in the distance, and soft natural window light",
+            "a calm sunlit wood-paneled study library viewed from a stationary standing position, with rows of bookshelves receding softly in depth and warm daylight streaming across a distant reading table",
+            "a modern quiet bookstore reading lounge seen from a fixed spot, with warm timber shelving, gentle natural window illumination, and calm atmospheric depth",
+        ]),
+        (["cà phê", "cafe", "coffee"], [
+            "a calm modern glass-walled specialty coffee shop in Tokyo viewed from one fixed standing spot, with warm wood textures, soft morning sunlight filtering through windows, and softly blurred seated patrons in the distance",
+            "an inviting minimalist cafe interior seen from a stationary point, featuring warm wooden counters, subtle hanging lamps, soft window daylight, and gentle depth across distant tables",
+            "a sunlit corner specialty coffee bar observed from a fixed standing position, with glass windows, soft indoor greenery, and quietly seated guests blurred softly in the background",
+        ]),
+        (["sân bay", "airport", "check-in", "nhà ga"], [
+            "a bright, spacious international airport terminal departure hall viewed from a single fixed standing spot, with sleek modern architectural columns, glowing flight information boards, and softly blurred distant passengers in the far background",
+            "a clean modern airport check-in concourse seen from a stationary standing point, featuring high glass ceilings, calm check-in counters in the mid-ground, and subtle ambient terminal depth",
+            "an airy international airport boarding lounge observed from one fixed position, with floor-to-ceiling terminal windows, soft diffused architectural lighting, and distant seating areas softly out of focus",
+        ]),
+        (["khách sạn", "hotel", "sảnh", "lobby"], [
+            "a luxury 5-star hotel lobby viewed from one fixed standing spot, with polished marble floors, warm architectural cove lighting, minimalist indoor greenery, and soft ambient depth in the background",
+            "an elegant upscale hotel reception lounge seen from a stationary position, featuring warm stone columns, subtle pendant lighting, and calm spacious seating softly blurred in the distance",
+        ]),
+        (["phố", "street", "tokyo", "châu âu", "đi bộ"], [
+            "an upscale city pedestrian boulevard observed from a single fixed standing spot on the sidewalk, with modern storefronts, leafy street trees, and calm architectural depth under natural daylight",
+            "a quiet sunlit European-style street corner viewed from a stationary standing position, with textured cafe facades, soft tree shade, and gentle urban depth in the distance",
+        ]),
+        (["văn phòng", "office", "họp", "công sở"], [
+            "a sleek contemporary tech executive office and glass meeting lounge viewed from one fixed standing spot, with clean architectural lines, wooden desk surfaces, and soft natural window light",
+            "a calm modern studio workspace seen from a stationary standing position, with frosted glass partitions, subtle indoor plants, and soft daylight across the distant room",
+        ]),
+        (["taxi", "xe hơi", "ô tô", "ghế sau"], [
+            "the calm parked rear cabin interior of a modern executive sedan observed from a fixed seated viewpoint, with soft natural daylight entering through the side windows and gently blurred city architecture outside",
+            "the quiet leather interior of a stationary modern car seen from a fixed passenger viewpoint, with clean dashboard/window framing and soft outdoor daylight outside the glass",
+        ]),
+        (["linh kiện", "điện tử", "thâm quyến", "sửa chữa"], [
+            "a bustling Shenzhen electronics components counter viewed from a single fixed standing spot, with organized component bins, warm overhead shop lighting, and softly blurred shelves in the background",
+            "an authentic electronics repair and parts shop interior seen from a stationary standing position, with tidy workbench tools, warm ceiling lights, and softly out-of-focus component drawers behind",
+        ]),
     ]
-    for keys, desc in presets:
+    v_idx = max(0, int(variation_seed))
+    base_desc = ""
+    for keys, variants in presets:
         if any(k in t for k in keys):
-            return desc
-    return (
-        f"a photorealistic real-world environment ({target_background_vi}) with authentic architectural depth, "
-        "natural ambient activity in the distance, and physically accurate perspective"
-    )
+            base_desc = variants[v_idx % len(variants)]
+            break
+    if not base_desc:
+        base_desc = (
+            f"a photorealistic real-world environment ({target_background_vi}) viewed from a single fixed standing spot, "
+            "with authentic architectural depth and physically accurate perspective"
+        )
+    flavor = _BG_VARIATION_FLAVORS[v_idx % len(_BG_VARIATION_FLAVORS)]
+    return f"{base_desc}, {flavor}" if flavor else base_desc
 
 
 def generate_flow_prompts(
@@ -303,7 +356,7 @@ def generate_flow_prompts(
         f"The scene depicts {ai_bg_en}, with a completely clear, unobstructed empty foreground (no hands, no person, no handheld device in the foreground). "
         f"Captured with {telemetry['bokeh_en']}, focused around the empty {telemetry['subject_distance_cm']}cm foreground plane so far-away objects stay naturally recognizable with only slight mobile softness and authentic consumer phone sensor texture. "
         f"Lighting features {telemetry['lighting_en']} at {telemetry['color_temp_en']} with natural spatial light gradients and realistic consumer mobile dynamic range. "
-        f"Include subtle, organic handheld phone camera breathing and micro-sway with strict frame-to-frame temporal stability, ready as a clean V2V compositing plate."
+        f"{STATIONARY_CAMERA_LOCK_EN}, with strict frame-to-frame temporal stability, ready as a clean compositing plate."
     )
 
     full_markdown = f"""### A. Phân Tích Quang Học Từ Ảnh/Video Gốc & Chiến Lược (AGY Photogrammetry Telemetry)
@@ -841,15 +894,11 @@ def analyze_video_optical_profile(
     color_tone_vi = f"{tone_temp_vi}, {sat_vi}, {bp_vi}" + (" (đã tách bỏ sai lệch từ phông xanh)" if is_green_screen_multi else "")
     color_tone_en = f"{tone_temp_en}, {sat_en}, {bp_en}" + (", completely free of any green-screen tint" if is_green_screen_multi else "")
 
-    if len(loaded_frames) == 1 or avg_motion < 0.35:
-        motion_vi = "Máy quay rất tĩnh / gần như cố định"
-        motion_en = "very steady near-locked handheld framing with minimal imperceptible breathing"
-    elif avg_motion < 2.2:
-        motion_vi = f"Rung nhẹ tự nhiên kiểu cầm tay (~{avg_motion}px/step)"
-        motion_en = "subtle organic handheld smartphone micro-breathing and gentle natural sway"
-    else:
-        motion_vi = f"Di chuyển / lia tay vừa (~{avg_motion}px/step)"
-        motion_en = "gentle continuous handheld smartphone walk/sway motion tracking smoothly"
+    # HARD CAMERA LOCK for foreground compositing plates:
+    # Even when the foreground hands/subject move in the source video, the background camera
+    # MUST stand completely still in one fixed spot with only imperceptible handheld micro-breathing.
+    motion_vi = STATIONARY_CAMERA_LOCK_VI
+    motion_en = STATIONARY_CAMERA_LOCK_EN
 
     if shot_kind == "portrait_medium":
         bg_scale_rule_vi = (
@@ -977,24 +1026,34 @@ def _craft_matched_environment_via_llm(
     target_background_vi: str,
     subject_description_vi: str,
     profile: Dict[str, Any],
+    variation_seed: int = 0,
 ) -> Optional[str]:
+    v_seed = max(0, int(variation_seed))
     sys_msg = (
         "You are an expert Cinematographer & VFX Compositing Supervisor. "
         "Translate the user's Vietnamese background description into 2-3 crisp, photorealistic English sentences "
         "describing ONLY the empty real-world environment and background props scaled accurately to match the camera telemetry. "
+        "CRITICAL CAMERA LOCK: The camera operator MUST stand completely still in one fixed spot with ONLY subtle imperceptible handheld micro-breathing — "
+        "STRICTLY FORBID walking, moving forward/backward, dolly, panning, tilting, or tracking camera shots. "
         "Never include hands, phones, or foreground objects in the description. Output ONLY English prose."
+    )
+    var_note = (
+        f"Variation #{v_seed + 1}: craft a fresh alternative camera framing/composition and subtle background layout for this location while keeping the camera 100% stationary in one fixed spot."
+        if v_seed > 0
+        else "Primary clean composition viewed from a single stationary standing spot."
     )
     color_tone_str = profile.get("color_tone_en") or f"~{profile.get('kelvin_est', 5400)}K"
     user_msg = (
         f"Vietnamese Background Idea: {target_background_vi}\n"
         f"Foreground Subject to Composite Later: {subject_description_vi}\n"
+        f"Composition Request: {var_note}\n"
         f"Optical & Color Profile: {profile['aspect_ratio_en']}, {profile['focal_length_mm']}mm smartphone lens, "
         f"{profile['camera_angle_en']}, {profile['bg_scale_rule_en']}, "
         f"{profile['lighting_en']}, {profile['shadow_direction_en']}, {profile['light_hardness_en']}, "
         f"Color & Tone: {color_tone_str}, {profile['exposure_en']}, "
         f"Sharpness & DoF: {profile.get('sharpness_en') or ''}, {profile['aperture_est']} subtle DoF (~{profile['bg_blur_sigma_px']}px), "
         f"Noise: {profile.get('noise_en') or 'fine organic sensor grain'}, "
-        f"Motion: {profile['camera_motion_en']}. Vision note: {profile.get('vision_notes') or 'none'}."
+        f"Camera Lock: {STATIONARY_CAMERA_LOCK_EN}. Vision note: {profile.get('vision_notes') or 'none'}."
     )
     payload = {
         "model": LOCAL_ROUTER_MODEL,
@@ -1002,7 +1061,7 @@ def _craft_matched_environment_via_llm(
             {"role": "system", "content": sys_msg},
             {"role": "user", "content": user_msg},
         ],
-        "temperature": 0.25,
+        "temperature": 0.25 if v_seed == 0 else 0.55,
         "max_tokens": 180,
         "stream": False,
     }
@@ -1027,11 +1086,13 @@ def generate_matched_background_prompts(
     target_background_vi: str,
     subject_description_vi: str = "",
     use_local_llm: bool = True,
+    variation_seed: int = 0,
 ) -> Dict[str, Any]:
     """
     Generate 3 optics-matched background prompts (Clean Video Plate, Google Flow V2V,
-    and Static Photo Plate) for ANY foreground subject (person, book, hands, product, gadget).
+    and Static Photo Plate) with HARD STATIONARY CAMERA LOCK for compositing stability.
     """
+    v_seed = max(0, int(variation_seed))
     bg_idea = (target_background_vi or "").strip() or "Phòng khách hoặc không gian tự nhiên có chiều sâu chân thực"
     subj_vi = (subject_description_vi or "").strip() or "Chủ thể chính đã khoanh vùng trong video gốc"
     subj_en = (
@@ -1040,9 +1101,9 @@ def generate_matched_background_prompts(
         else "the exact foreground subject(s), pose, clothing/skin texture, and held items from the source video"
     )
 
-    ai_bg_en = _craft_matched_environment_via_llm(bg_idea, subj_vi, profile) if use_local_llm else None
+    ai_bg_en = _craft_matched_environment_via_llm(bg_idea, subj_vi, profile, variation_seed=v_seed) if use_local_llm else None
     if not ai_bg_en:
-        ai_bg_en = _offline_bg_translation(bg_idea)
+        ai_bg_en = _offline_bg_translation(bg_idea, variation_seed=v_seed)
 
     scale_en = profile.get("bg_scale_rule_en") or profile["scale_calibration_en"]
     shadow_en = profile.get("shadow_direction_en") or "consistent soft contact shadows"
@@ -1054,29 +1115,30 @@ def generate_matched_background_prompts(
     noise_en = profile.get("noise_en") or "subtle organic smartphone sensor grain"
     aperture_est = profile.get("aperture_est", "f/2.2")
     bg_blur = profile.get("bg_blur_sigma_px", 1.2)
-    motion_en = profile.get("camera_motion_en") or "subtle organic natural camera motion"
     dist_focus = profile.get("subject_distance_label") or f"~{profile['subject_distance_cm']}cm"
 
     clean_plate_prompt = (
         f"Photorealistic clean empty background plate video in {profile['aspect_ratio_en']}, "
         f"{profile['scale_calibration_en']}. "
+        f"Camera Motion Lock: {STATIONARY_CAMERA_LOCK_EN}. "
         f"Depict {ai_bg_en}, with a completely open, unobstructed empty foreground (strictly NO people, NO hands, NO held objects in the center foreground plane). "
         f"Scale & Framing: {scale_en} "
         f"Lighting, Color & Tone: match {profile['lighting_en']} with {color_tone_en}, {hard_en}, {shadow_en}, and {exp_en} so foreground subjects composite seamlessly with minimal color grading. "
-        f"Optics, Sharpness & Sensor Noise: {profile['focal_length_mm']}mm {aperture_est} focused around {dist_focus}, {sharp_en}, background sitting at ~{bg_blur}px gentle optical softness with {noise_en} (strictly NO glossy CGI or synthetic AI hyper-sharpness), and {motion_en}."
+        f"Optics, Sharpness & Sensor Noise: {profile['focal_length_mm']}mm {aperture_est} focused around {dist_focus}, {sharp_en}, background sitting at ~{bg_blur}px gentle optical softness with {noise_en} (strictly NO glossy CGI or synthetic AI hyper-sharpness). Keep the camera locked stationary in one spot with only tiny natural breathing and strict temporal stability."
     )
 
     v2v_prompt = (
         f"Video-to-video background replacement in {profile['aspect_ratio_en']}, {profile['scale_calibration_en']}. "
         f"KEEP {subj_en} 100% intact with identical silhouette, details, surface texture, and original motion. "
+        f"Camera Motion Lock: {STATIONARY_CAMERA_LOCK_EN}. "
         f"CHANGE only the environment behind the foreground into {ai_bg_en}, strictly obeying the perspective rule: {scale_en} "
         f"Match illumination and grading with {profile['lighting_en']}, {color_tone_en}, {hard_en}, {shadow_en}, {exp_en}. "
-        f"Render background optics at {aperture_est} (~{bg_blur}px natural softness) matching {sharp_en} and {noise_en}, with strict temporal frame-to-frame stability."
+        f"Render background optics at {aperture_est} (~{bg_blur}px natural softness) matching {sharp_en} and {noise_en}, with strict temporal frame-to-frame stability and zero camera drift or walking."
     )
 
     still_bg_prompt = (
         f"Authentic candid photograph of an empty background scene in {profile['aspect_ratio_en']}, "
-        f"{profile['scale_calibration_en']}. Scene: {ai_bg_en}, completely unobstructed empty foreground (no subject blocking center foreground). "
+        f"{profile['scale_calibration_en']}. Scene: {ai_bg_en}, completely unobstructed empty foreground (no subject blocking center foreground), viewed from a single fixed standing spot. "
         f"{scale_en} Illuminated by {profile['lighting_en']} with {color_tone_en}, {hard_en}, {shadow_en}, and {exp_en}. "
         f"Captured at {profile['focal_length_mm']}mm {aperture_est} focused at {dist_focus} with {sharp_en}, ~{bg_blur}px gentle background softness, and {noise_en}."
     )
@@ -1084,10 +1146,10 @@ def generate_matched_background_prompts(
     full_markdown = (
         f"### Phân Tích Quang Học & Màu Sắc ({profile.get('analysis_mode', 'Multi-Frame')})\n"
         f"- **Kích thước, Hướng & Tỷ lệ chủ thể:** `{profile['focal_length_mm']}mm`, rộng ~`{profile.get('hand_width_pct', profile['foreground_occupancy_pct'])}%` × cao ~`{profile.get('hand_height_pct', 50)}%` ({profile.get('subject_orientation_vi', 'thẳng')}) ở `{dist_focus}` — {profile.get('bg_scale_rule_vi', profile['scale_calibration_vi'])}\n"
+        f"- **Khóa chuyển động Camera:** {STATIONARY_CAMERA_LOCK_VI}\n"
         f"- **Hướng sáng & Bóng đổ:** `{profile['lighting_direction']}` — {profile.get('shadow_direction_vi', '')} ({profile.get('light_hardness_vi', '')})\n"
         f"- **Màu sắc, Tone & Điểm đen:** `~{kelvin_est}K` | {profile.get('color_tone_vi', '')} | {profile.get('exposure_vi', '')}\n"
-        f"- **Độ nét & Độ mờ hậu cảnh:** `{aperture_est}` (~`{bg_blur}px` blur) | {profile.get('sharpness_vi', '')}\n"
-        f"- **Độ nhiễu hạt (Noise/ISO) & Chuyển động:** {profile.get('noise_vi', '')} | {profile.get('camera_motion_vi', '')}\n"
+        f"- **Độ nét, Độ mờ nền & Nhiễu hạt:** `{aperture_est}` (~`{bg_blur}px` blur) | {profile.get('sharpness_vi', '')} | {profile.get('noise_vi', '')}\n"
         + (f"- **Nhận xét Vision AI:** {profile['vision_notes']}\n" if profile.get("vision_notes") else "")
     )
 
@@ -1096,6 +1158,7 @@ def generate_matched_background_prompts(
         "v2v_prompt": v2v_prompt,
         "still_bg_prompt": still_bg_prompt,
         "ai_bg_en": ai_bg_en,
+        "variation_seed": v_seed,
         "telemetry_cards": profile.get("telemetry_cards", []),
         "profile": profile,
         "full_markdown": full_markdown,
