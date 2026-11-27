@@ -384,38 +384,59 @@
 
           <!-- TAB: LIGHT -->
           <div class="itab-pane active" data-pane="light">
-            <div class="slider-list">
+            <div class="bg-section-label" style="margin-top:0">Đồng bộ Tổng thể 2 chiều &amp; Ánh sáng 3D Đường Bao</div>
+            <div class="slider-list" style="margin-top:6px">
+              <label class="slider-row" title="Phân tích và kéo cả Chủ thể lẫn Nền về chung 1 tông màu, điểm đen, độ tương phản và độ hạt cảm biến">
+                <div class="slider-head"><span>✨ Đồng bộ 2 chiều (Tone · Tương phản · Nhiễu)</span><span class="mono val" data-val-for="slUnifiedHarm">0.65</span></div>
+                <input type="range" id="slUnifiedHarm" class="live-param" min="0" max="1" step="0.05" value="0.65" />
+              </label>
+              <label class="slider-row" title="Tự động chuyển sáng dần hoặc tối dần ở cấp độ pixel ôm theo độ cong đường bao 3D để tạo khối chiều sâu tự nhiên">
+                <div class="slider-head"><span>🌗 Ánh sáng 3D ven đường bao (Tạo chiều sâu)</span><span class="mono val" data-val-for="slContourRelight">0.60</span></div>
+                <input type="range" id="slContourRelight" class="live-param" min="0" max="1" step="0.05" value="0.60" />
+              </label>
+              <label class="slider-row" title="Độ rộng vùng chuyển sáng/tối mượt từ mép đường bao ăn dần vào trong khối vật thể">
+                <div class="slider-head"><span>📐 Độ rộng chuyển sáng đường bao (px)</span><span class="mono val" data-val-for="slContourRad">28</span></div>
+                <input type="range" id="slContourRad" class="live-param" min="4" max="72" step="2" value="28" />
+              </label>
+              <label class="slider-row" title="Đo và cân bằng độ nét quang học giữa chủ thể gốc và nền mới như quay cùng 1 ống kính">
+                <div class="slider-head"><span>🔎 Đồng bộ độ nét quang học (Gốc ⟷ Nền)</span><span class="mono val" data-val-for="slSharpMatch">0.55</span></div>
+                <input type="range" id="slSharpMatch" class="live-param" min="0" max="1" step="0.05" value="0.55" />
+              </label>
+            </div>
+
+            <div class="bg-section-label">Tinh chỉnh Ánh sáng &amp; Cảm biến Chi tiết</div>
+            <div class="slider-list" style="margin-top:6px">
               <label class="slider-row">
-                <div class="slider-head"><span>Khớp nhiệt độ màu Lab</span><span class="mono val" data-val-for="slAmbient">0.68</span></div>
-                <input type="range" id="slAmbient" class="live-param" min="0" max="1" step="0.04" value="0.68" />
+                <div class="slider-head"><span>Khớp nhiệt độ màu Lab</span><span class="mono val" data-val-for="slAmbient">0.25</span></div>
+                <input type="range" id="slAmbient" class="live-param" min="0" max="1" step="0.05" value="0.25" />
               </label>
               <label class="slider-row">
-                <div class="slider-head"><span>Khớp hướng sáng 2D</span><span class="mono val" data-val-for="slDirLight">0.45</span></div>
-                <input type="range" id="slDirLight" class="live-param" min="0" max="1" step="0.04" value="0.45" />
+                <div class="slider-head"><span>Khớp hướng sáng 2D</span><span class="mono val" data-val-for="slDirLight">0.25</span></div>
+                <input type="range" id="slDirLight" class="live-param" min="0" max="1" step="0.05" value="0.25" />
               </label>
               <label class="slider-row">
-                <div class="slider-head"><span>Cân bằng điểm đen &amp; Tương phản</span><span class="mono val" data-val-for="slBlackPoint">0.35</span></div>
-                <input type="range" id="slBlackPoint" class="live-param" min="0" max="1" step="0.05" value="0.35" />
+                <div class="slider-head"><span>Cân bằng điểm đen &amp; Tương phản</span><span class="mono val" data-val-for="slBlackPoint">0.20</span></div>
+                <input type="range" id="slBlackPoint" class="live-param" min="0" max="1" step="0.05" value="0.20" />
               </label>
               <label class="slider-row">
                 <div class="slider-head"><span>Bán kính đổ bóng mép viền (px)</span><span class="mono val" data-val-for="slLwRad">4</span></div>
                 <input type="range" id="slLwRad" class="live-param" min="0" max="15" step="1" value="4" />
               </label>
               <label class="slider-row">
-                <div class="slider-head"><span>Cường độ ánh sáng bọc viền</span><span class="mono val" data-val-for="slLwStr">0.65</span></div>
-                <input type="range" id="slLwStr" class="live-param" min="0" max="1" step="0.04" value="0.65" />
+                <div class="slider-head"><span>Cường độ ánh sáng bọc viền</span><span class="mono val" data-val-for="slLwStr">0.20</span></div>
+                <input type="range" id="slLwStr" class="live-param" min="0" max="1" step="0.05" value="0.20" />
               </label>
               <label class="slider-row">
                 <div class="slider-head"><span>Độ bóng kính màn hình</span><span class="mono val" data-val-for="slGlare">0.06</span></div>
                 <input type="range" id="slGlare" class="live-param" min="0" max="0.4" step="0.02" value="0.06" />
               </label>
               <label class="slider-row">
-                <div class="slider-head"><span>Hạt nhiễu cảm biến (Grain)</span><span class="mono val" data-val-for="slGrain">0.12</span></div>
-                <input type="range" id="slGrain" class="live-param" min="0" max="0.5" step="0.03" value="0.12" />
+                <div class="slider-head"><span>Đồng bộ hạt nhiễu 2 chiều (Grain)</span><span class="mono val" data-val-for="slGrain">0.35</span></div>
+                <input type="range" id="slGrain" class="live-param" min="0" max="1.0" step="0.05" value="0.35" />
               </label>
               <label class="slider-row">
-                <div class="slider-head"><span>Làm mềm hậu cảnh (px)</span><span class="mono val" data-val-for="slBgDefocus">0.6</span></div>
-                <input type="range" id="slBgDefocus" class="live-param" min="0" max="15" step="0.2" value="0.6" />
+                <div class="slider-head"><span>Làm mềm hậu cảnh (px)</span><span class="mono val" data-val-for="slBgDefocus">0.4</span></div>
+                <input type="range" id="slBgDefocus" class="live-param" min="0" max="15" step="0.2" value="0.4" />
               </label>
             </div>
             <div class="check-grid">

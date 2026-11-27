@@ -343,18 +343,23 @@ class PreviewReq(BaseModel):
     erode_dilate: float = 0.0
     edge_preserve: float = 0.0
     edge_blur_match: float = 0.0
-    ambient_color_strength: float = 0.68
-    directional_light_strength: float = 0.45
-    black_point_match: float = 0.35
+    ambient_color_strength: float = 0.25
+    directional_light_strength: float = 0.25
+    black_point_match: float = 0.20
     light_wrap_radius: int = 4
-    light_wrap_strength: float = 0.65
+    light_wrap_strength: float = 0.20
     protect_screen: bool = True
     screen_glare: float = 0.06
-    grain_match: float = 0.12
-    bg_defocus: float = 0.6
+    grain_match: float = 0.35
+    bg_defocus: float = 0.4
     clean_ai_ghost: bool = False
     linear_compositing: bool = True
     pass2_legacy: bool = False
+    # Unified Bidirectional Harmonization & 3D Contour Pixel-Level Relighting
+    unified_harmonize: float = 0.65
+    contour_relight: float = 0.60
+    contour_relight_radius: int = 28
+    sharpness_match: float = 0.55
     # Background transform, color grading & reverse light/tone matching (BG -> Source)
     bg_scale: float = 1.0
     bg_offset_x: float = 0.0
@@ -723,6 +728,10 @@ def _compute_preview_bundle(sess: SessionState, req: PreviewReq) -> Tuple[np.nda
         round(float(req.bg_saturation), 3),
         round(float(req.bg_temperature), 3),
         round(float(req.bg_tint), 3),
+        round(float(req.unified_harmonize), 3),
+        round(float(req.contour_relight), 3),
+        int(req.contour_relight_radius),
+        round(float(req.sharpness_match), 3),
     )
     cached = sess.comp_cache.get(comp_key)
     if cached is not None:
@@ -751,6 +760,10 @@ def _compute_preview_bundle(sess: SessionState, req: PreviewReq) -> Tuple[np.nda
         bg_saturation=float(req.bg_saturation),
         bg_temperature=float(req.bg_temperature),
         bg_tint=float(req.bg_tint),
+        unified_harmonize_strength=float(req.unified_harmonize),
+        contour_relight_strength=float(req.contour_relight),
+        contour_relight_radius=int(req.contour_relight_radius),
+        sharpness_match_strength=float(req.sharpness_match),
     )
     scr_mask = (
         detect_emissive_screen_mask(fg_clean, (alpha > 0.15).astype(np.uint8))
@@ -852,7 +865,7 @@ def _run_render_job(sess: SessionState, job_id: str, req: RenderReq) -> None:
             alpha_or_mask_paths = tracked_paths
             is_alpha_stream = False
 
-        # Stratified 10% Multi-Model QA Audit & Closed-Loop Auto-Healing
+        # Stratified Multi-Model QA Audit & Closed-Loop Auto-Healing (catches entering 2nd hands & dropouts!)
         qa_report: Optional[Dict[str, Any]] = None
         if n_src > 2 and bool(req.auto_qa_heal):
             def _repropagate_healed(healed_kfs: Dict[int, np.ndarray]) -> None:
@@ -861,33 +874,43 @@ def _run_render_job(sess: SessionState, job_id: str, req: RenderReq) -> None:
                 if is_alpha_stream and req.matting_engine == "matanyone2":
                     merged_kfs = {**confirmed, **healed_kfs}
                     h_sorted = sorted(healed_kfs.keys())
-                    win_lo = max(0, h_sorted[0] - 24)
-                    win_hi = min(n_src, h_sorted[-1] + 25)
-                    slice_frames = src_frames[win_lo:win_hi]
-                    slice_kfs = {k - win_lo: v for k, v in merged_kfs.items() if win_lo <= k < win_hi}
-                    if slice_frames and slice_kfs:
-                        heal_dir = work / "matanyone2_qa_heal"
-                        reprop_paths = run_matanyone2_video(
-                            slice_frames,
-                            slice_kfs,
-                            heal_dir,
-                            max_internal_size=int(req.matanyone_max_size),
-                        )
-                        for local_i, rp in enumerate(reprop_paths):
-                            g_i = win_lo + local_i
-                            if g_i in healed_kfs:
-                                continue
-                            if rp.is_file():
-                                shutil.copy2(rp, alpha_or_mask_paths[g_i])
-                        shutil.rmtree(heal_dir, ignore_errors=True)
+                    # Group distant healed frames into tight clusters so a long 1000+ frame video
+                    # only re-propagates around actual defect windows instead of the whole video.
+                    clusters: List[List[int]] = [[h_sorted[0]]]
+                    for idx_h in h_sorted[1:]:
+                        if idx_h - clusters[-1][-1] <= 90:
+                            clusters[-1].append(idx_h)
+                        else:
+                            clusters.append([idx_h])
+                    for ci, cl in enumerate(clusters):
+                        win_lo = max(0, cl[0] - 36)
+                        win_hi = min(n_src, cl[-1] + 37)
+                        slice_frames = src_frames[win_lo:win_hi]
+                        slice_kfs = {k - win_lo: v for k, v in merged_kfs.items() if win_lo <= k < win_hi}
+                        if slice_frames and slice_kfs:
+                            heal_dir = work / f"matanyone2_qa_heal_{ci}"
+                            reprop_paths = run_matanyone2_video(
+                                slice_frames,
+                                slice_kfs,
+                                heal_dir,
+                                max_internal_size=int(req.matanyone_max_size),
+                            )
+                            for local_i, rp in enumerate(reprop_paths):
+                                g_i = win_lo + local_i
+                                if g_i in healed_kfs:
+                                    continue
+                                if rp.is_file():
+                                    shutil.copy2(rp, alpha_or_mask_paths[g_i])
+                            shutil.rmtree(heal_dir, ignore_errors=True)
 
+            dynamic_max_samples = min(44, max(20, n_src // 24))
             qa_report = audit_and_heal_video_mattes(
                 src_frames,
                 alpha_or_mask_paths,
                 is_alpha_stream=is_alpha_stream,
                 sample_ratio=float(np.clip(req.qa_sample_pct, 0.05, 0.25)),
                 min_samples=min(4, n_src),
-                max_samples=20,
+                max_samples=dynamic_max_samples,
                 use_birefnet_crosscheck=ai_on,
                 heal_repropagate_cb=_repropagate_healed if is_alpha_stream else None,
                 progress_cb=lambda frac, msg: job.update(
@@ -943,15 +966,47 @@ def _run_render_job(sess: SessionState, job_id: str, req: RenderReq) -> None:
             bg_saturation=float(req.bg_saturation),
             bg_temperature=float(req.bg_temperature),
             bg_tint=float(req.bg_tint),
+            unified_harmonize_strength=float(req.unified_harmonize),
+            contour_relight_strength=float(req.contour_relight),
+            contour_relight_radius=int(req.contour_relight_radius),
+            sharpness_match_strength=float(req.sharpness_match),
         )
 
-        job.update(progress=0.52, message="Đang bóc màu viền, ghép ánh sáng & nén GPU H.264...")
+        job.update(progress=0.52, message="Đang bóc màu viền GPU, ghép ánh sáng 3D & nén NVENC H.264...")
         audio_src = (
             src_media
             if (req.audio_choice == "source" and not sess.src_is_image)
             else (bg_media if (req.audio_choice == "background" and not sess.bg_is_image) else None)
         )
         out_mp4 = work / "AGY_TachNen_Final.mp4"
+
+        # Detect green-screen backdrop ONCE on representative keyframes instead of repeating per frame
+        # (saves ~23 seconds on a 1,000-frame video!).
+        scene_is_green = bool(req.despill_green)
+        if not scene_is_green and float(req.decont_strength) > 0.05:
+            probe_ids = sorted({0, n_src // 2})
+            for pid in probe_ids:
+                p_bgr = _load_bgr(src_frames[pid])
+                p_alp = (
+                    load_alpha(alpha_or_mask_paths[pid])
+                    if is_alpha_stream
+                    else load_mask(alpha_or_mask_paths[pid]).astype(np.float32)
+                )
+                if is_green_screen_scene(p_bgr, p_alp):
+                    scene_is_green = True
+                    break
+
+        # Cache static single-image BG once so zero redundant disk reads/warps happen across frames
+        static_bg_transformed: Optional[np.ndarray] = None
+        if len(bg_frames) == 1:
+            static_bg_transformed = transform_background_frame(
+                _load_bgr(bg_frames[0]),
+                w,
+                h,
+                scale=float(req.bg_scale),
+                offset_x=float(req.bg_offset_x),
+                offset_y=float(req.bg_offset_y),
+            )
 
         def _render_frame(
             t: int,
@@ -961,15 +1016,12 @@ def _run_render_job(sess: SessionState, job_id: str, req: RenderReq) -> None:
         ) -> np.ndarray:
             fg_clean = fg_clean_opt
             if fg_clean is None:
-                eff_despill = bool(req.despill_green) or (
-                    float(req.decont_strength) > 0.05 and is_green_screen_scene(src_bgr, alpha_t)
-                )
                 fg_clean = (
                     estimate_foreground_pymatting(
                         src_bgr,
                         alpha_t,
                         strength=float(req.decont_strength),
-                        despill_green=eff_despill,
+                        despill_green=scene_is_green,
                     )
                     if req.use_pymatting_fg
                     else src_bgr
@@ -987,19 +1039,19 @@ def _run_render_job(sess: SessionState, job_id: str, req: RenderReq) -> None:
                         offset_y=float(req.bg_offset_y),
                     )
             else:
-                if len(bg_frames) == 1:
-                    t_bg = 0
+                if static_bg_transformed is not None:
+                    bg_bgr = static_bg_transformed
                 else:
                     mapped = int(round(t * (bg_fps / max(src_fps, 1.0))))
                     t_bg = mapped % len(bg_frames)
-                bg_bgr = transform_background_frame(
-                    _load_bgr(bg_frames[t_bg]),
-                    w,
-                    h,
-                    scale=float(req.bg_scale),
-                    offset_x=float(req.bg_offset_x),
-                    offset_y=float(req.bg_offset_y),
-                )
+                    bg_bgr = transform_background_frame(
+                        _load_bgr(bg_frames[t_bg]),
+                        w,
+                        h,
+                        scale=float(req.bg_scale),
+                        offset_x=float(req.bg_offset_x),
+                        offset_y=float(req.bg_offset_y),
+                    )
                 if cam_transforms is not None and t < len(cam_transforms):
                     bg_bgr = warp_bg_with_camera_motion(bg_bgr, cam_transforms[t], (w, h))
                 elif v2v_transforms is not None and t < len(v2v_transforms):
@@ -1014,30 +1066,46 @@ def _run_render_job(sess: SessionState, job_id: str, req: RenderReq) -> None:
                 frame_idx=t,
             )
 
-        workers = min(8, max(4, os.cpu_count() or 4))
+        # Keep worker count balanced (4 threads) to avoid OpenCV/CUDA oversubscription while keeping GPU saturated
+        workers = 4 if torch.cuda.is_available() else min(8, max(4, os.cpu_count() or 4))
         max_in_flight = workers * 2
         in_flight: deque = deque()
         written_count = 0
         prev_alpha = None
         prev_src = None
 
+        def _load_src_and_matte(idx_t: int) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+            sb = _load_bgr(src_frames[idx_t])
+            if is_alpha_stream:
+                return sb, load_alpha(alpha_or_mask_paths[idx_t]), None
+            if idx_t in sess.birefnet_alpha_by_frame and req.matting_engine in ("birefnet", "matanyone2"):
+                return sb, sess.birefnet_alpha_by_frame[idx_t], None
+            return sb, None, load_mask(alpha_or_mask_paths[idx_t])
+
         with (
             VideoPipeEncoder(out_mp4, w, h, fps=src_fps, audio_source_path=audio_src, prefer_nvenc=True) as enc,
+            ThreadPoolExecutor(max_workers=2) as io_ex,
             ThreadPoolExecutor(max_workers=workers) as ex,
         ):
+            prefetch_io: deque = deque()
+            for pre_t in range(min(4, n_src)):
+                prefetch_io.append(io_ex.submit(_load_src_and_matte, pre_t))
+            next_io_t = min(4, n_src)
+
             for t in range(n_src):
-                src_bgr = _load_bgr(src_frames[t])
+                src_bgr, loaded_alpha, loaded_mask = prefetch_io.popleft().result()
+                if next_io_t < n_src:
+                    prefetch_io.append(io_ex.submit(_load_src_and_matte, next_io_t))
+                    next_io_t += 1
+
                 raw_fg_opt: Optional[np.ndarray] = None
-                if is_alpha_stream:
-                    alpha_t = load_alpha(alpha_or_mask_paths[t])
+                if loaded_alpha is not None:
+                    alpha_t = loaded_alpha
                 else:
-                    if t in sess.birefnet_alpha_by_frame and req.matting_engine in ("birefnet", "matanyone2"):
-                        alpha_t = sess.birefnet_alpha_by_frame[t]
-                    else:
-                        mask_t = load_mask(alpha_or_mask_paths[t])
-                        mres = extract_pixel_accurate_matte(src_bgr, mask_t, mcfg)
-                        alpha_t = mres.alpha
-                        raw_fg_opt = mres.fg_clean_bgr
+                    assert loaded_mask is not None
+                    mres = extract_pixel_accurate_matte(src_bgr, loaded_mask, mcfg)
+                    alpha_t = mres.alpha
+                    raw_fg_opt = mres.fg_clean_bgr
 
                 needs_edge_refine = (
                     float(req.edge_preserve) > 0.01
@@ -1055,10 +1123,7 @@ def _run_render_job(sess: SessionState, job_id: str, req: RenderReq) -> None:
                         edge_preserve=float(req.edge_preserve),
                         edge_feather=float(req.edge_blur_match),
                     )
-                if raw_fg_opt is not None and (
-                    needs_edge_refine
-                    or (not req.despill_green and float(req.decont_strength) > 0.05 and is_green_screen_scene(src_bgr, alpha_t))
-                ):
+                if raw_fg_opt is not None and (needs_edge_refine or (scene_is_green and not req.despill_green)):
                     raw_fg_opt = None
 
                 alpha_stable = stabilize_alpha_temporal(

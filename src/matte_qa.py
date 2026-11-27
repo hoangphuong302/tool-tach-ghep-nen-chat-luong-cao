@@ -407,11 +407,17 @@ def audit_and_heal_video_mattes(
         }
 
     # Stage 1: 100% ultra-fast downsampled temporal area + IoU scan
+    # PLUS periodic outside-matte RGB motion scan so newly entering hands/objects dropped by tracker are caught!
     if progress_cb:
-        progress_cb(0.05, "🛡️ QA Quét 100% đường cong diện tích theo thời gian...")
+        progress_cb(0.05, "🛡️ QA Quét 100% đường cong diện tích & vật thể mới vào khung...")
     areas: List[float] = []
     ious: List[float] = [1.0]
     prev_small: Optional[np.ndarray] = None
+    motion_step = max(1, n_frames // 140)
+    prev_src_small: Optional[np.ndarray] = None
+    entering_motion_scores: List[Tuple[float, int]] = []
+    k_dil7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+
     for t in range(n_frames):
         p = matte_paths[t]
         m_u8 = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
@@ -428,6 +434,24 @@ def audit_and_heal_video_mattes(
             ious.append(inter / union)
         prev_small = small
 
+        # Fast outside-matte RGB motion check (detects 2nd hand / new object entering while tracker ignores it)
+        if t % motion_step == 0:
+            src_img = cv2.imread(str(frame_paths[t]))
+            if src_img is not None:
+                mw = 128
+                mh = max(64, int(round(src_img.shape[0] * (mw / max(1, src_img.shape[1])))))
+                src_s = cv2.resize(src_img, (mw, mh), interpolation=cv2.INTER_AREA).astype(np.int16)
+                if prev_src_small is not None and prev_src_small.shape == src_s.shape:
+                    m_s = cv2.resize(m_u8, (mw, mh), interpolation=cv2.INTER_AREA) >= 90
+                    outside_m = ~(cv2.dilate(m_s.astype(np.uint8), k_dil7) > 0)
+                    if int(np.sum(outside_m)) > 200:
+                        diff_rgb = np.mean(np.abs(src_s - prev_src_small), axis=2)
+                        changed = (diff_rgb >= 20.0) & outside_m
+                        chg_ratio = float(np.sum(changed)) / float(mw * mh)
+                        if chg_ratio >= 0.012:
+                            entering_motion_scores.append((chg_ratio, t))
+                prev_src_small = src_s
+
     temporal_outliers: List[int] = []
     arr_a = np.asarray(areas, dtype=np.float32)
     for t in range(n_frames):
@@ -437,7 +461,7 @@ def audit_and_heal_video_mattes(
             if arr_a[t] < loc_med * 0.94 or arr_a[t] > loc_med * 1.07 or ious[t] < 0.93:
                 temporal_outliers.append(t)
 
-    # Stage 2: Stratified ~10% frames + up to 6 temporal outliers
+    # Stage 2: Stratified ~10% frames + temporal outliers + outside-matte entering-object spikes
     k_strat = int(round(n_frames * float(np.clip(sample_ratio, 0.02, 0.50))))
     k_strat = max(min(min_samples, n_frames), min(max_samples, k_strat))
     strat_indices = np.unique(np.linspace(0, n_frames - 1, num=k_strat, dtype=int)).tolist()
@@ -445,7 +469,14 @@ def audit_and_heal_video_mattes(
         temporal_outliers,
         key=lambda t: (ious[t] if t < len(ious) else 1.0),
     )[:6]
-    audit_indices = sorted(set(strat_indices) | set(outlier_extra))
+    # Pick top well-spaced entering-motion frames (e.g. second hand entering from border mid-video)
+    entering_extra: List[int] = []
+    for _, cand_t in sorted(entering_motion_scores, reverse=True):
+        if all(abs(cand_t - ex) >= max(8, motion_step * 2) for ex in entering_extra):
+            entering_extra.append(cand_t)
+        if len(entering_extra) >= 8:
+            break
+    audit_indices = sorted(set(strat_indices) | set(outlier_extra) | set(entering_extra))
 
     if crosscheck_fn is None and use_birefnet_crosscheck:
         from src.neural_matting import release_neural_models, run_birefnet_matting
@@ -481,17 +512,35 @@ def audit_and_heal_video_mattes(
                 alpha_ref = np.clip(crosscheck_fn(bgr).astype(np.float32), 0.0, 1.0)
                 fg_bin = (alpha_t >= 0.45).astype(np.uint8)
                 fg_area_cur = max(1, int(np.sum(fg_bin > 0)))
-                fg_near = cv2.dilate(fg_bin, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (41, 41))) > 0
+                fg_near = cv2.dilate(fg_bin, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (65, 65))) > 0
 
-                # Missing chunk: BiRefNet confident (>= 0.68), tracker dropped (< 0.35), touching/near tracked subject, <= 35% of FG
-                miss_cand = ((alpha_ref >= 0.68) & (alpha_t < 0.35) & fg_near).astype(np.uint8)
+                # Missing chunk / entering second hand:
+                # Find WHOLE connected components of BiRefNet-confident foreground dropped by tracker
+                # FIRST (never clip components by a narrow fg_near ribbon, which previously chopped off
+                # entering second hands/palms 20px from the device!). Accept the entire component if it
+                # touches/approaches the tracked subject OR enters cleanly from a frame border.
+                miss_raw = ((alpha_ref >= 0.58) & (alpha_t < 0.35)).astype(np.uint8)
                 min_miss_area = max(140, int(h * w * 0.00025))
-                max_miss_area = max(min_miss_area + 100, int(fg_area_cur * 0.35))
-                nm, lm, sm, _ = cv2.connectedComponentsWithStats(miss_cand, connectivity=8)
+                max_miss_area = max(min_miss_area + 200, int(max(fg_area_cur * 0.95, h * w * 0.35)))
+                min_border_hand_area = max(min_miss_area * 3, int(h * w * 0.008))
+                nm, lm, sm, _ = cv2.connectedComponentsWithStats(miss_raw, connectivity=8)
                 for cid in range(1, nm):
                     area_c = int(sm[cid, cv2.CC_STAT_AREA])
-                    if min_miss_area <= area_c <= max_miss_area:
-                        missing_mask[lm == cid] = 1
+                    if not (min_miss_area <= area_c <= max_miss_area):
+                        continue
+                    comp = lm == cid
+                    touches_fg = bool(np.any(comp & fg_near))
+                    cx, cy, cbw, cbh = (
+                        int(sm[cid, cv2.CC_STAT_LEFT]),
+                        int(sm[cid, cv2.CC_STAT_TOP]),
+                        int(sm[cid, cv2.CC_STAT_WIDTH]),
+                        int(sm[cid, cv2.CC_STAT_HEIGHT]),
+                    )
+                    touches_border = (cx <= 2) or (cy <= 2) or (cx + cbw >= w - 2) or (cy + cbh >= h - 2)
+                    if touches_fg:
+                        missing_mask[comp] = 1
+                    elif touches_border and area_c >= min_border_hand_area and float(np.mean(alpha_ref[comp])) >= 0.78:
+                        missing_mask[comp] = 1
 
                 # Excess leak: skip erasing confirmed keyframe choices; only trim peripheral blobs <= 40% of FG
                 if confirmed_frame_indices is None or int(t) not in confirmed_frame_indices:
