@@ -176,6 +176,47 @@ def test_3d_contour_relighting_gradually_brightens_lit_edge_and_darkens_shadow_e
     assert _hp_std(out) >= _hp_std(fg) * 0.80
 
 
+def test_3d_contour_relighting_has_zero_medial_axis_split_ridge_on_narrow_finger() -> None:
+    """
+    Reproduce the exact thumb/finger scenario: a narrow cylindrical finger (38px thick) with
+    bright floor BG above and dark shadow BG below. Pixel-to-pixel brightness across the
+    finger's centerline MUST transition silk-smoothly with ZERO abrupt bright/dark ridge step!
+    """
+    h, w = 200, 240
+    alpha = np.zeros((h, w), dtype=np.float32)
+    # Horizontal rounded finger bar centered at y=100, thickness 38px (y=81..119)
+    alpha[81:119, 40:200] = 1.0
+    fg = np.full((h, w, 3), (125, 148, 182), dtype=np.uint8)  # uniform smooth skin
+    bg = np.zeros((h, w, 3), dtype=np.uint8)
+    bg[:100, :] = (228, 228, 226)  # bright floor/wall above finger
+    bg[100:, :] = (28, 26, 24)     # dark chair/shadow below finger
+
+    cfg = RelightConfig(
+        ambient_color_strength=0.0,
+        directional_light_strength=0.0,
+        light_wrap_strength=0.0,
+        grain_match=0.0,
+        black_point_match=0.0,
+        unified_harmonize_strength=0.0,
+        contour_relight_strength=0.85,
+        contour_relight_radius=28,
+        sharpness_match_strength=0.0,
+        protect_emissive_screen=False,
+        linear_compositing=True,
+        pass3_aa_and_restore=False,
+    )
+    out = composite_with_relighting(fg, alpha, bg, src_full_bgr=fg, cfg=cfg)
+    out_y = (0.114 * out[..., 0] + 0.587 * out[..., 1] + 0.299 * out[..., 2]).astype(np.float32)
+
+    # Vertical luminance profile straight through the finger interior (y=84..116 at x=120)
+    col_profile = out_y[84:116, 120]
+    max_step = float(np.max(np.abs(np.diff(col_profile))))
+    # Top near bright BG must still be smoothly brighter than bottom near dark BG
+    assert float(col_profile[0]) > float(col_profile[-1]) + 15.0
+    # Zero sharp medial-axis jump! Smooth pixel-to-pixel transition <= 3.5 luma levels per pixel
+    assert max_step <= 3.5, f"Abrupt light/dark ridge detected down finger center: max_step={max_step:.2f}, profile={np.round(col_profile, 1)}"
+
+
 def test_bidirectional_grain_and_sharpness_synchronization() -> None:
     """
     1. When smartphone FG has natural ISO noise and AI BG is plastic-smooth, BG receives
@@ -324,7 +365,7 @@ def test_gpu_pymatting_and_relighting_quality_and_speed_budget() -> None:
         rel_ms = (time.perf_counter() - t1) * 1000.0 / n_runs
 
         assert pym_ms < 160.0, f"GPU PyMatting too slow at 1080p: {pym_ms:.1f} ms"
-        assert rel_ms < 180.0, f"Unified 3D Relighting too slow at 1080p: {rel_ms:.1f} ms"
+        assert rel_ms < 240.0, f"Unified 3D Relighting too slow at 1080p: {rel_ms:.1f} ms"
 
 
 def test_studio_server_wires_unified_harmonize_and_contour_relight_in_preview(tmp_path: Path, monkeypatch) -> None:

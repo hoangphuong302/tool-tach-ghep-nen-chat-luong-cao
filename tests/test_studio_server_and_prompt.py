@@ -93,7 +93,9 @@ def test_multiframe_optical_profile_and_matched_prompts() -> None:
         target_background_vi="Quầy bán linh kiện điện tử sáng tự nhiên",
         use_local_llm=False,
     )
-    assert "clean_plate_prompt" in prompts and "NO hands" in prompts["clean_plate_prompt"]
+    assert "clean_plate_prompt" in prompts
+    cp_low = prompts["clean_plate_prompt"].lower()
+    assert "open empty floor" in cp_low and "hand" not in cp_low and "bokeh" not in cp_low
     assert "v2v_prompt" in prompts and "KEEP" in prompts["v2v_prompt"]
     assert "still_bg_prompt" in prompts and str(profile["focal_length_mm"]) in prompts["still_bg_prompt"]
 

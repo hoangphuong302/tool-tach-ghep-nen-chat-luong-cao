@@ -16,21 +16,41 @@ LOCAL_ROUTER_KEY = "sk-00b59870f0cdb29e-od5qn5-26b35cc0"
 LOCAL_ROUTER_MODEL = "editvideo"
 
 STATIONARY_CAMERA_LOCK_VI = (
-    "KHÓA CỨNG CAMERA ĐỨNG IM 1 CHỖ + ĐUNG ĐƯA TAY CẦM RẤT NHẸ: người quay đứng yên 1 vị trí cố định "
-    "(KHÔNG đi bộ, KHÔNG tiến/lùi, KHÔNG lia pan/tilt/zoom), nhưng có độ đung đưa & rung vi mô rất nhẹ nhàng "
-    "tự nhiên như đang cầm điện thoại bằng tay thật (không cứng đơ như đặt trên tripod)."
+    "KHÓA CỨNG CAMERA ĐỨNG IM 1 CHỖ + ĐUNG ĐƯA TỰ NHIÊN RẤT NHẸ: camera giữ cố định 1 vị trí đứng "
+    "(KHÔNG đi bộ, KHÔNG tiến/lùi, KHÔNG lia pan/tilt/zoom), chỉ có độ đung đưa & dao động nhịp thở cực nhẹ "
+    "tự nhiên như quay bằng điện thoại thường (không cứng đơ như đặt trên tripod)."
 )
 STATIONARY_CAMERA_LOCK_EN = (
-    "STATIONARY STANDING CAMERA WITH GENTLE HANDHELD SWAY: the person holding the smartphone stands in one fixed spot "
-    "(STRICTLY NO walking, NO stepping forward or backward, NO dolly/tracking movement, NO panning, NO tilting, NO orbiting, NO zooming), "
-    "with a very gentle, slow natural handheld sway and subtle real-life hand micro-tremor as if holding a phone casually in hand while standing still — never frozen stiff like a tripod"
+    "Stationary standing camera with gentle organic sway: camera viewpoint stays anchored at one fixed standing spot "
+    "(strictly no walking, no stepping forward or backward, no dolly, no panning, no tilting, no orbiting, no zooming), "
+    "moving only with a very gentle, slow natural breathing sway rather than tripod-rigid"
 )
 
 RAW_SMARTPHONE_REALISM_EN = (
-    "RAW UNEDITED EVERYDAY SMARTPHONE FOOTAGE LOOK: shot casually on an ordinary mid-range consumer phone camera with a small mobile sensor "
-    "(deep mobile depth of field where background objects remain mostly recognizable with only mild natural unsharpness and slight everyday phone video compression — "
-    "STRICTLY NO cinematic film look, NO DSLR/mirrorless camera look, NO creamy portrait bokeh, NO overly smooth denoised AI plastic surfaces, "
-    "NO studio commercial color grading, NO glowing HDR gloss)"
+    "Raw unedited everyday smartphone footage quality: recorded casually on an ordinary mid-range mobile camera "
+    "with a small phone sensor and deep front-to-back sharp focus (near floor, mid-ground counters, distant signs, "
+    "text boards, and background people all remain crisp, clear, and readable across the whole frame), plain documentary "
+    "auto-exposure, flat natural colors, subtle everyday digital grain, and authentic mobile H.264 video clarity"
+)
+
+_CLEAN_PLATE_FORBIDDEN_TOKENS = (
+    "hand",
+    "holding",
+    "device",
+    "smartphone in",
+    "phone in",
+    "bokeh",
+    "dslr",
+    "mirrorless",
+    "cinematic",
+    "blur",
+    "unsharpness",
+    "shallow depth",
+    "f/1.",
+    "hdr",
+    "30cm",
+    "close-up",
+    "foreground subject",
 )
 
 _BG_VARIATION_FLAVORS = (
@@ -884,23 +904,23 @@ def analyze_video_optical_profile(
         sat_en = "muted natural low-to-moderate color saturation"
     elif sat_med >= 0.48:
         sat_vi = "màu sắc tươi rõ"
-        sat_en = "moderately rich, natural smartphone color saturation (non-oversaturated)"
+        sat_en = "moderately rich natural color saturation"
     else:
         sat_vi = "bão hòa cân bằng trung thực"
-        sat_en = "balanced true-to-life consumer smartphone color saturation (no HDR oversaturation)"
+        sat_en = "balanced true-to-life everyday color saturation"
 
     if black_p5 >= 28.0:
         bp_vi = f"vùng tối nâng nhẹ kiểu matte (P5={int(black_p5)})"
-        bp_en = "slightly lifted matte shadow floor with gentle contrast roll-off (avoid crushed pitch blacks)"
+        bp_en = "slightly lifted matte shadow floor with gentle contrast roll-off"
     elif black_p5 <= 14.0:
         bp_vi = f"vùng tối sâu rõ (P5={int(black_p5)}, P95={int(white_p95)})"
-        bp_en = "rich natural black-point depth and realistic dynamic range without harsh HDR clipping"
+        bp_en = "natural shadow depth and realistic dynamic range"
     else:
         bp_vi = f"tương phản & điểm đen cân bằng (P5={int(black_p5)}, P95={int(white_p95)})"
-        bp_en = "balanced smartphone contrast curve with natural shadow floor and soft highlight roll-off"
+        bp_en = "balanced everyday contrast curve with natural shadow floor"
 
     color_tone_vi = f"{tone_temp_vi}, {sat_vi}, {bp_vi}" + (" (đã tách bỏ sai lệch từ phông xanh)" if is_green_screen_multi else "")
-    color_tone_en = f"{tone_temp_en}, {sat_en}, {bp_en}" + (", completely free of any green-screen tint" if is_green_screen_multi else "")
+    color_tone_en = f"{tone_temp_en}, {sat_en}, {bp_en}"
 
     # HARD CAMERA LOCK for foreground compositing plates:
     # Even when the foreground hands/subject move in the source video, the background camera
@@ -1038,32 +1058,27 @@ def _craft_matched_environment_via_llm(
 ) -> Optional[str]:
     v_seed = max(0, int(variation_seed))
     sys_msg = (
-        "You are a candid real-world smartphone video supervisor (NOT a commercial cinema director). "
-        "Translate the user's Vietnamese background description into 2-3 plain, unglamorous, raw everyday English sentences "
-        "describing ONLY the empty real-world environment as captured casually on an ordinary mid-range smartphone. "
-        "CRITICAL CAMERA LOCK: The person holding the phone stands in one fixed spot with a very gentle, slow natural handheld sway — "
-        "STRICTLY FORBID walking, moving forward/backward, dolly, panning, tilting, or tracking shots. "
-        "ANTI-CINEMATIC RULE: STRICTLY FORBID words like 'cinematic', 'luxury', 'sleek', 'sophisticated', 'dreamy', 'creamy bokeh', "
-        "'softly blurred', 'shallow depth of field', 'dramatic lighting', or 'glossy'. Keep it ordinary, real, and unpolished. "
-        "Never include hands, phones, or foreground objects. Output ONLY English prose."
+        "You translate a Vietnamese real-world location into 2 plain, positive everyday English sentences "
+        "describing ONLY an empty, open real-world place viewed from a stationary standing spot. "
+        "STRICT POSITIVE-ONLY RULES: Describe ONLY visible background architecture, open floor, counters, "
+        "and distant everyday details in crisp front-to-back focus. "
+        "NEVER use words like hand, hands, holding, phone, smartphone, device, close-up, foreground object, "
+        "bokeh, blur, blurred, unsharpness, shallow depth, DSLR, cinematic, luxury, sleek, dramatic, or HDR. "
+        "Output ONLY 2 short plain English sentences."
     )
     var_note = (
-        f"Variation #{v_seed + 1}: craft a fresh alternative camera framing/composition and subtle background layout for this location while keeping the camera 100% stationary in one fixed spot."
+        f"Variation #{v_seed + 1}: describe a slightly different everyday angle/layout of this location from one stationary standing spot."
         if v_seed > 0
-        else "Primary clean composition viewed from a single stationary standing spot."
+        else "Primary clean open view from a single stationary standing spot."
     )
     color_tone_str = profile.get("color_tone_en") or f"~{profile.get('kelvin_est', 5400)}K"
     user_msg = (
-        f"Vietnamese Background Idea: {target_background_vi}\n"
-        f"Foreground Subject to Composite Later: {subject_description_vi}\n"
-        f"Composition Request: {var_note}\n"
-        f"Optical & Color Profile: {profile['aspect_ratio_en']}, {profile['focal_length_mm']}mm smartphone lens, "
-        f"{profile['camera_angle_en']}, {profile['bg_scale_rule_en']}, "
-        f"{profile['lighting_en']}, {profile['shadow_direction_en']}, {profile['light_hardness_en']}, "
-        f"Color & Tone: {color_tone_str}, {profile['exposure_en']}, "
-        f"Sharpness & DoF: {profile.get('sharpness_en') or ''}, {profile['aperture_est']} subtle DoF (~{profile['bg_blur_sigma_px']}px), "
-        f"Noise: {profile.get('noise_en') or 'fine organic sensor grain'}, "
-        f"Camera Lock: {STATIONARY_CAMERA_LOCK_EN}. Vision note: {profile.get('vision_notes') or 'none'}."
+        f"Vietnamese Location: {target_background_vi}\n"
+        f"Framing: {var_note}\n"
+        f"Perspective: {profile['aspect_ratio_en']}, {profile['focal_length_mm']}mm wide view, "
+        f"open empty floor in lower/center view, mid-ground 2-4m ahead.\n"
+        f"Lighting & Tone: {profile['lighting_en']}, {color_tone_str}, {profile['light_hardness_en']}.\n"
+        f"Focus: deep crisp front-to-back sharp focus where signs and textures stay clear."
     )
     payload = {
         "model": LOCAL_ROUTER_MODEL,
@@ -1072,7 +1087,7 @@ def _craft_matched_environment_via_llm(
             {"role": "user", "content": user_msg},
         ],
         "temperature": 0.25 if v_seed == 0 else 0.55,
-        "max_tokens": 180,
+        "max_tokens": 140,
         "stream": False,
     }
     try:
@@ -1084,7 +1099,9 @@ def _craft_matched_environment_via_llm(
         with urllib.request.urlopen(req, timeout=10.0) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             txt = str(((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip().strip('"')
-            if len(txt) > 25:
+            low = txt.lower()
+            # Reject any LLM hallucination that injects pink-elephant triggers (hands/phones/bokeh/blur/cinematic)
+            if len(txt) > 25 and not any(tok in low for tok in _CLEAN_PLATE_FORBIDDEN_TOKENS):
                 return txt
     except Exception:
         pass
@@ -1100,7 +1117,9 @@ def generate_matched_background_prompts(
 ) -> Dict[str, Any]:
     """
     Generate 3 optics-matched background prompts (Clean Video Plate, Google Flow V2V,
-    and Static Photo Plate) with HARD STATIONARY CAMERA LOCK for compositing stability.
+    and Static Photo Plate) with HARD STATIONARY CAMERA LOCK and strictly positive-only
+    everyday smartphone framing (zero pink-elephant tokens that cause Veo/Flow to spawn
+    phantom hands, phones, or fake blurry DSLR bokeh).
     """
     v_seed = max(0, int(variation_seed))
     bg_idea = (target_background_vi or "").strip() or "Phòng khách hoặc không gian tự nhiên có chiều sâu chân thực"
@@ -1126,34 +1145,49 @@ def generate_matched_background_prompts(
     aperture_est = profile.get("aperture_est", "f/2.2")
     bg_blur = profile.get("bg_blur_sigma_px", 1.2)
     dist_focus = profile.get("subject_distance_label") or f"~{profile['subject_distance_cm']}cm"
+    focal_mm = int(profile.get("focal_length_mm", 24))
+    pitch_deg = int(profile.get("camera_pitch_deg", -12))
+    pitch_abs = abs(pitch_deg)
+    horizon_pct = int(round(np.clip(52.0 - (pitch_deg + 10) * 0.6, 38.0, 58.0)))
+    iso_est = int(profile.get("iso_est", 200))
+    dist_mid = "1.5–2.5m" if profile.get("shot_kind") != "portrait_medium" else "2.0–3.5m"
+    dist_far = "3–6m" if profile.get("shot_kind") != "portrait_medium" else "4–8m"
 
+    # Prompt 1 (Clean Background Video for Google Flow / Veo 3):
+    # Strictly positive-only, ZERO mention of hands, holding, phones-in-frame, 30cm close-ups,
+    # bokeh, blur, DSLR, or cinema — guarantees an empty open sharp everyday smartphone plate!
     clean_plate_prompt = (
-        f"Raw unedited everyday smartphone background video in {profile['aspect_ratio_en']}, "
-        f"{profile['scale_calibration_en']}. "
+        f"Raw unedited everyday smartphone video in {profile['aspect_ratio_en']}, wide {focal_mm}mm mobile lens "
+        f"angled {pitch_abs} degrees slightly downward with horizon at {horizon_pct}% frame height. "
         f"{RAW_SMARTPHONE_REALISM_EN}. "
         f"Camera Motion: {STATIONARY_CAMERA_LOCK_EN}. "
-        f"Scene: {ai_bg_en}, with a completely empty, unobstructed foreground (strictly NO people, NO hands, NO held objects in the center foreground). "
-        f"Scale & Framing: {scale_en} "
-        f"Ungraded Lighting, Color & Tone: match {profile['lighting_en']} with {color_tone_en}, {hard_en}, {shadow_en}, and {exp_en} using ordinary unedited smartphone auto-exposure and auto white balance so real phone footage composites seamlessly. "
-        f"Everyday Phone Optics, Sharpness & Noise: small consumer phone sensor ({profile['focal_length_mm']}mm, deep natural phone DoF — NOT DSLR f/1.4 bokeh, background stays recognizable with only mild ~{bg_blur}px everyday lens unsharpness), matching {sharp_en} and {noise_en} with authentic mobile H.264 video texture and strict frame-to-frame stability."
+        f"Open Empty Scene: {ai_bg_en}. The entire lower and center area of the frame shows only open empty floor "
+        f"and clear unobstructed space stretching smoothly forward toward mid-ground counters/furniture ({dist_mid} away) "
+        f"and background architecture/people ({dist_far} away) at natural {focal_mm}mm eye-level scale. "
+        f"Lighting, Color & Detail: {profile['lighting_en']}, {color_tone_en}, {hard_en}, {shadow_en}, {exp_en}, "
+        f"crisp front-to-back 1080p mobile clarity so signs and background textures stay clearly readable, "
+        f"natural ~ISO {iso_est} {noise_en}, and steady frame-to-frame stability."
     )
 
     v2v_prompt = (
-        f"Raw everyday smartphone video-to-video background replacement in {profile['aspect_ratio_en']}, {profile['scale_calibration_en']}. "
+        f"Raw unedited everyday smartphone video-to-video background replacement in {profile['aspect_ratio_en']}, "
+        f"wide {focal_mm}mm mobile lens angled {pitch_abs} degrees downward (horizon at {horizon_pct}%). "
         f"{RAW_SMARTPHONE_REALISM_EN}. "
         f"KEEP {subj_en} 100% intact with identical silhouette, details, surface texture, and original motion. "
         f"Camera Motion: {STATIONARY_CAMERA_LOCK_EN}. "
-        f"CHANGE only the environment behind the foreground into {ai_bg_en}, strictly obeying the perspective rule: {scale_en} "
-        f"Match plain ungraded lighting and color with {profile['lighting_en']}, {color_tone_en}, {hard_en}, {shadow_en}, {exp_en}. "
-        f"Render background with ordinary small-sensor phone optics (deep natural focus, only mild ~{bg_blur}px optical unsharpness — NO creamy DSLR bokeh or smooth AI sheen), matching {sharp_en} and {noise_en}, with strict temporal frame-to-frame stability."
+        f"CHANGE only the environment behind the subject into {ai_bg_en}, strictly obeying the perspective rule: {scale_en} "
+        f"Match plain everyday lighting and color with {profile['lighting_en']}, {color_tone_en}, {hard_en}, {shadow_en}, {exp_en}, "
+        f"with crisp deep mobile focus, {sharp_en}, and ~ISO {iso_est} {noise_en}, maintaining steady temporal stability."
     )
 
     still_bg_prompt = (
-        f"Raw unedited candid smartphone photo of an empty everyday background scene in {profile['aspect_ratio_en']}, "
-        f"{profile['scale_calibration_en']}. {RAW_SMARTPHONE_REALISM_EN}. "
-        f"Scene: {ai_bg_en}, completely unobstructed empty foreground, viewed from a single fixed standing spot. "
-        f"{scale_en} Illuminated by {profile['lighting_en']} with {color_tone_en}, {hard_en}, {shadow_en}, and {exp_en}. "
-        f"Captured casually on a mid-range {profile['focal_length_mm']}mm smartphone camera (deep natural mobile focus, only mild ~{bg_blur}px optical unsharpness — NO DSLR portrait blur), matching {sharp_en} and {noise_en}."
+        f"Raw unedited candid smartphone photograph of an empty open everyday place in {profile['aspect_ratio_en']}, "
+        f"wide {focal_mm}mm mobile camera angled {pitch_abs} degrees downward with horizon at {horizon_pct}% height. "
+        f"{RAW_SMARTPHONE_REALISM_EN}. "
+        f"Open Empty Scene: {ai_bg_en}, with empty unobstructed floor and open space across the lower and center frame, "
+        f"mid-ground surfaces {dist_mid} ahead and background elements {dist_far} away. "
+        f"Illuminated by {profile['lighting_en']} with {color_tone_en}, {hard_en}, {shadow_en}, and {exp_en}, "
+        f"crisp front-to-back sharp everyday phone clarity and natural ~ISO {iso_est} mobile sensor grain."
     )
 
     full_markdown = (

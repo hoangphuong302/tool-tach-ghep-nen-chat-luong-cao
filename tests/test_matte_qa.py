@@ -612,14 +612,18 @@ def test_optical_prompt_measures_noise_sharpness_tone_and_orientation_on_green_s
         use_local_llm=False,
     )
     cp = prompts["clean_plate_prompt"].lower()
-    assert "iso" in cp and "k" in cp and "tilted" in cp and "unsharpness" in cp
+    v2v = prompts["v2v_prompt"].lower()
+    assert "iso" in cp and "k" in cp and "deep front-to-back sharp focus" in cp
+    assert "tilted" in v2v
 
 
 def test_stationary_camera_lock_and_prompt_regeneration_variations(tmp_path: Path, monkeypatch) -> None:
     """
-    Prompts MUST enforce stationary standing camera with gentle handheld sway (NEVER walking,
-    NEVER tripod-frozen, NEVER cinematic/DSLR bokeh), Windows FFmpeg subprocesses MUST hide
-    console windows, and regenerating prompts reuses cached profile with fresh variations.
+    Clean background prompts MUST be strictly positive-only (ZERO pink-elephant tokens like
+    'hand', 'holding', '30cm', 'bokeh', 'blur', 'dslr', 'cinematic' that trick Veo 3 / Flow
+    into hallucinating a foreground smartphone in hand or blurry portrait bokeh!), enforce
+    stationary standing camera with gentle organic sway, hide Windows FFmpeg consoles, and
+    regenerate fresh variations using cached profile.
     """
     import os
     from fastapi.testclient import TestClient
@@ -642,18 +646,23 @@ def test_stationary_camera_lock_and_prompt_regeneration_variations(tmp_path: Pat
 
     profile = analyze_video_optical_profile(frames, sample_count=3, use_vision_ai=False)
     assert "stationary standing camera" in profile["camera_motion_en"].lower()
-    assert "gentle handheld sway" in profile["camera_motion_en"].lower()
+    assert "gentle organic sway" in profile["camera_motion_en"].lower()
     assert "strictly no walking" in profile["camera_motion_en"].lower()
     assert "walk/sway" not in profile["camera_motion_en"].lower()
 
     p0 = generate_matched_background_prompts(profile, "Sảnh sân bay quốc tế hiện đại", use_local_llm=False, variation_seed=0)
     p1 = generate_matched_background_prompts(profile, "Sảnh sân bay quốc tế hiện đại", use_local_llm=False, variation_seed=1)
     cp0 = p0["clean_plate_prompt"].lower()
-    assert "stationary standing camera with gentle handheld sway" in cp0
+    sp0 = p0["still_bg_prompt"].lower()
+    assert "stationary standing camera with gentle organic sway" in cp0
     assert "strictly no walking" in cp0
     assert "raw unedited everyday smartphone" in cp0
-    assert "no cinematic film look" in cp0
-    assert "no creamy portrait bokeh" in cp0
+    assert "deep front-to-back sharp focus" in cp0
+    # Anti-pink-elephant guard: clean background plate & still photo MUST NEVER mention hands/phones-in-hand/bokeh/blur/cinematic!
+    forbidden = ("hand", "holding", "device", "30cm", "close-up", "foreground subject", "cinematic", "dslr", "bokeh", "f/1.", "unsharpness", "blur", "hdr", "green-screen")
+    for bad in forbidden:
+        assert bad not in cp0, f"Forbidden pink-elephant token '{bad}' leaked into clean_plate_prompt!"
+        assert bad not in sp0, f"Forbidden pink-elephant token '{bad}' leaked into still_bg_prompt!"
     assert "strictly no walking" in p0["v2v_prompt"].lower()
     assert p0["clean_plate_prompt"] != p1["clean_plate_prompt"]
 

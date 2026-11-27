@@ -674,44 +674,50 @@ def _compute_3d_contour_fields_small(
     strength: float,
     radius_s: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Compute smooth 2.5D contour relighting (mult_rgb_s, add_rgb_s) at working resolution."""
-    sh, sw = fg_s.shape[:2]
+    """
+    Compute C-infinity silky-smooth 2.5D contour relighting (mult_rgb_s, add_rgb_s) at working resolution.
+    Uses:
+      1. Multi-scale Normalized-Convolution Harmonic Light Diffusion from outside BG inward
+         (completely eliminates medial-axis remap discontinuities down the center of fingers/thumbs!).
+      2. C-infinity Gaussian height-field surface normals N(x,y) that smoothly vanish to (0, 0, 1)
+         along finger centerlines (zero sharp light/dark split ridges!).
+      3. Bidirectional Fresnel bright rim + dark shadow terminator + Half-Lambert 3D hemisphere shading.
+    """
     r_s = max(3.0, float(radius_s))
     s = float(np.clip(strength, 0.0, 1.0))
+    m_f = (m_s > 0).astype(np.float32)
 
+    # 1. Smooth inward distance & gentle falloff weight (zero corner kinks!)
     d_in = cv2.distanceTransform(m_s, cv2.DIST_L2, 5)
     max_d = max(float(d_in.max()), 1.0)
+    d_smooth = cv2.GaussianBlur(d_in, (0, 0), sigmaX=max(1.5, r_s * 0.25))
+    d_loc_thick = cv2.GaussianBlur(d_in, (0, 0), sigmaX=max(2.5, r_s * 0.65))
+    r_local = np.clip(d_loc_thick * 2.1, max(3.5, r_s * 0.55), r_s)
 
-    # Adaptive local curvature width: thin fingers curve tightly, broad palms curve gracefully
-    d_loc_smooth = cv2.GaussianBlur(d_in, (0, 0), sigmaX=max(2.0, r_s * 0.55))
-    r_local = np.clip(d_loc_smooth * 2.1, max(3.0, r_s * 0.55), r_s)
-    u_rim = np.clip(d_in / np.maximum(r_local, 1e-3), 0.0, 1.0)
-    g_rim = np.power(1.0 - u_rim, 1.55) * (m_s > 0)
+    u_rim = np.clip(d_smooth / np.maximum(r_local, 1e-3), 0.0, 1.0)
+    # Smoothstep cosine-like curve: C1 continuous at u=0 and u=1 (keep smooth across boundary so final polish never bleeds 1.0 inward)
+    ss_rim = u_rim * u_rim * (3.0 - 2.0 * u_rim)
+    g_rim = np.power(1.0 - ss_rim, 1.35)
 
-    # Outward contour normal (ox, oy) pointing strictly from FG interior -> across silhouette -> into BG
-    d_grad_src = cv2.GaussianBlur(d_in, (0, 0), sigmaX=max(1.2, r_s * 0.14))
-    gx = cv2.Sobel(d_grad_src, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(d_grad_src, cv2.CV_32F, 0, 1, ksize=3)
-    gn = np.sqrt(gx * gx + gy * gy + 1e-5)
-    ox = -gx / gn
-    oy = -gy / gn
+    # 2. Multi-scale Normalized-Convolution Harmonic Light Diffusion from OUTSIDE BG inward:
+    # Guaranteed C-infinity smooth across the entire finger/thumb interior — ZERO medial-axis jump!
+    out_m = 1.0 - m_f
+    bg_outside = bg_s * out_m[..., None]
+    env_acc = np.zeros_like(bg_s, dtype=np.float32)
+    for sig_d, wgt in (
+        (max(2.0, r_s * 0.35), 0.45),
+        (max(4.5, r_s * 0.90), 0.35),
+        (max(9.0, r_s * 1.85), 0.20),
+    ):
+        num = _fast_lowpass(bg_outside, sigma_full=sig_d, scale=0.5)
+        den = np.maximum(_fast_lowpass(out_m, sigma_full=sig_d, scale=0.5), 1e-4)[..., None]
+        env_acc += (num / den) * wgt
 
-    # 3-scale local boundary environment sampling OUTSIDE the silhouette along (ox, oy)
-    bg_env = cv2.GaussianBlur(bg_s, (0, 0), sigmaX=max(2.0, r_s * 0.25))
-    grid_x, grid_y = np.meshgrid(np.arange(sw, dtype=np.float32), np.arange(sh, dtype=np.float32))
-    env_acc = np.zeros_like(bg_env)
-    for out_off, wgt in ((max(3.0, r_s * 0.25), 0.48), (max(8.0, r_s * 0.70), 0.34), (max(16.0, r_s * 1.40), 0.18)):
-        step_d = d_in + out_off
-        sx = np.clip(grid_x + ox * step_d, 0.0, float(sw - 1))
-        sy = np.clip(grid_y + oy * step_d, 0.0, float(sh - 1))
-        env_acc += cv2.remap(bg_env, sx, sy, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE) * wgt
-
-    # Local intrinsic shading base of FG (normalized inside mask so exterior never leaks in)
-    m_f = m_s.astype(np.float32)
+    # 3. Local intrinsic shading base of FG (normalized inside mask so exterior never leaks in)
     y_fg_s = 0.114 * fg_s[..., 0] + 0.587 * fg_s[..., 1] + 0.299 * fg_s[..., 2]
-    sig_sh = max(2.0, r_s * 0.22)
-    fg_sh_num = cv2.GaussianBlur(y_fg_s * m_f, (0, 0), sigmaX=sig_sh)
-    fg_sh_den = np.maximum(cv2.GaussianBlur(m_f, (0, 0), sigmaX=sig_sh), 1e-3)
+    sig_sh = max(2.5, r_s * 0.32)
+    fg_sh_num = _fast_lowpass(y_fg_s * m_f, sigma_full=sig_sh, scale=0.5)
+    fg_sh_den = np.maximum(_fast_lowpass(m_f, sigma_full=sig_sh, scale=0.5), 1e-3)
     s_fg_s = fg_sh_num / fg_sh_den
     y_edge_s = 0.114 * env_acc[..., 0] + 0.587 * env_acc[..., 1] + 0.299 * env_acc[..., 2]
 
@@ -719,37 +725,54 @@ def _compute_3d_contour_fields_small(
     delta_y = y_edge_s - s_fg_s
 
     # Bright-side Fresnel rim & bounced contour light (soft-knee protects highlights)
-    w_bright = g_rim * np.clip(delta_y, 0.0, 0.90) * (0.95 * s)
+    w_bright = (g_rim * m_f) * np.clip(delta_y, 0.0, 0.90) * (0.95 * s)
     headroom = np.clip(1.0 - 0.58 * s_fg_s, 0.15, 1.0)
-    add_rgb_s = (env_acc * 0.74 + fg_s * 0.26) * (w_bright * headroom)[..., None]
+    add_rgb_s = (env_acc * 0.72 + fg_s * 0.28) * (w_bright * headroom)[..., None]
 
     # Dark-side contour terminator & ambient bounce shadow roll-off
-    w_dark = np.power(g_rim, 1.25) * np.clip(-delta_y, 0.0, 0.90) * (0.78 * s)
-    mult_dark_s = 1.0 - np.clip(w_dark, 0.0, 0.52)
+    w_dark = np.power(g_rim, 1.20) * np.clip(-delta_y, 0.0, 0.90) * (0.82 * s)
+    mult_dark_s = 1.0 - np.clip(w_dark, 0.0, 0.50)
 
-    # Broad 2.5D dome normal for 3D directional Half-Lambert hemisphere sculpting across whole hand/volume
-    # Half-Lambert (0.5 * N·L + 0.5) stays strictly monotonic all the way to the dark shadow terminator!
-    u_broad = np.clip(d_in / max(max_d * 0.95, r_s), 0.0, 1.0)
-    nz_broad = np.sqrt(np.clip(1.0 - (1.0 - u_broad) ** 2, 0.06, 1.0))
-    sin_broad = np.sqrt(np.clip(1.0 - nz_broad * nz_broad, 0.0, 1.0))
-    nx_b = ox * sin_broad
-    ny_b = oy * sin_broad
+    # 4. C-infinity Smooth 2.5D Gaussian Height-Field Surface Normals (ZERO ridge along finger centerline!):
+    # Blending a medium and broad Gaussian height field produces smooth cylindrical curvature where
+    # gradient naturally goes to (0, 0) along the spine of every finger (normal smoothly -> (0, 0, 1)).
+    sig_h1 = max(2.5, r_s * 0.45)
+    sig_h2 = max(6.0, min(max_d * 0.65, r_s * 1.45))
+    h_field = 0.55 * _fast_lowpass(m_f, sigma_full=sig_h1, scale=0.5) + 0.45 * _fast_lowpass(m_f, sigma_full=sig_h2, scale=0.5)
+    gx_h = cv2.Sobel(h_field, cv2.CV_32F, 1, 0, ksize=3)
+    gy_h = cv2.Sobel(h_field, cv2.CV_32F, 0, 1, ksize=3)
+    # Soft-scale gradient relative to robust 90th-percentile slope inside FG (never divides by ~0 at ridge!)
+    g_mag = np.hypot(gx_h, gy_h)
+    fg_slopes = g_mag[m_s > 0]
+    ref_slope = max(float(np.percentile(fg_slopes, 92)) if len(fg_slopes) > 16 else 0.05, 1e-3)
+    # Outward tilt smoothly proportional to slope / ref_slope -> vanishes smoothly at finger spine!
+    nx_b = np.clip(-gx_h / (ref_slope * 1.15), -0.92, 0.92)
+    ny_b = np.clip(-gy_h / (ref_slope * 1.15), -0.92, 0.92)
+    xy2 = nx_b * nx_b + ny_b * ny_b
+    over = xy2 > 0.88
+    if np.any(over):
+        sc = np.sqrt(0.88 / np.maximum(xy2, 1e-5))
+        nx_b = np.where(over, nx_b * sc, nx_b)
+        ny_b = np.where(over, ny_b * sc, ny_b)
+        xy2 = np.minimum(xy2, 0.88)
+    nz_broad = np.sqrt(np.clip(1.0 - xy2, 0.12, 1.0))
 
     lx_b, ly_b, lz_b = profile.bg_light_dir
     lx_f, ly_f, lz_f = profile.fg_light_dir
     hl_bg = 0.5 * (nx_b * lx_b + ny_b * ly_b + nz_broad * lz_b) + 0.5
     hl_fg = 0.5 * (nx_b * lx_f + ny_b * ly_f + nz_broad * lz_f) + 0.5
-    hemi_gain_s = np.where(
-        m_s > 0,
-        np.exp(np.clip((hl_bg - hl_fg) * (0.68 * s), -0.45, 0.38)),
-        1.0,
-    ).astype(np.float32)
+    hemi_gain_s = np.exp(np.clip((hl_bg - hl_fg) * (0.64 * s), -0.42, 0.36)).astype(np.float32)
 
     # Subtle shadow tinting toward local dark BG color on shadowed contours
     env_chroma_ratio = env_acc / np.maximum(y_edge_s[..., None], 0.08)
-    env_chroma_ratio = np.clip(env_chroma_ratio, 0.82, 1.22)
-    shadow_tint_w = np.clip(w_dark * 0.45, 0.0, 0.25)[..., None]
+    env_chroma_ratio = np.clip(env_chroma_ratio, 0.84, 1.20)
+    shadow_tint_w = np.clip(w_dark * 0.40, 0.0, 0.22)[..., None]
     mult_rgb_s = (mult_dark_s * hemi_gain_s)[..., None] * (1.0 - shadow_tint_w + shadow_tint_w * env_chroma_ratio)
+
+    # Final subtle spatial polish on the low-frequency illumination fields guarantees zero banding/seams
+    sig_pol = max(1.0, r_s * 0.14)
+    mult_rgb_s = cv2.GaussianBlur(mult_rgb_s.astype(np.float32), (0, 0), sigmaX=sig_pol)
+    add_rgb_s = cv2.GaussianBlur(add_rgb_s.astype(np.float32), (0, 0), sigmaX=sig_pol)
     return mult_rgb_s.astype(np.float32), add_rgb_s.astype(np.float32)
 
 
