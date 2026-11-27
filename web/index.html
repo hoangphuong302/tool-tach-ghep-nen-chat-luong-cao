@@ -1,0 +1,463 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Tách Nền & Ghép Cảnh AI — AGY Studio</title>
+  <link rel="stylesheet" href="./static/styles.css" />
+</head>
+<body>
+  <div class="studio-shell">
+    <!-- Top Header -->
+    <header class="topbar">
+      <div class="topbar-left">
+        <div class="brand">
+          <span class="brand-icon" aria-hidden="true">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><line x1="20" y1="4" x2="8.12" y2="15.88"/><line x1="14.47" y1="14.48" x2="20" y2="20"/><line x1="8.12" y1="8.12" x2="12" y2="12"/></svg>
+          </span>
+          <div class="brand-copy">
+            <strong>Tách Nền &amp; Ghép Cảnh AI</strong>
+            <span id="gpuBadge" class="sub-badge">CUDA Sẵn sàng</span>
+          </div>
+        </div>
+      </div>
+
+      <nav class="step-tabs" role="tablist" aria-label="Quy trình tách ghép nền">
+        <button type="button" class="step-tab active" data-step="cut" role="tab" aria-selected="true">
+          <span class="tab-num">1</span>
+          <span class="tab-label">Tách Nền</span>
+        </button>
+        <button type="button" class="step-tab" data-step="prompt" role="tab" aria-selected="false">
+          <span class="tab-num">2</span>
+          <span class="tab-label">Prompt Bối Cảnh</span>
+        </button>
+        <button type="button" class="step-tab" data-step="composite" role="tab" aria-selected="false">
+          <span class="tab-num">3</span>
+          <span class="tab-label">Ghép &amp; Live Preview</span>
+        </button>
+      </nav>
+
+      <div class="topbar-right">
+        <span id="diskBadge" class="pill-stat" title="Dung lượng file tạm phiên hiện tại trên máy chủ">Phiên: 0 MB</span>
+        <button type="button" id="cleanupBtn" class="btn btn-ghost btn-sm" title="Xóa toàn bộ file tạm của phiên này trên máy chủ">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+          <span>Xóa tạm</span>
+        </button>
+        <button type="button" id="themeBtn" class="btn btn-ghost btn-sm" title="Đổi giao diện Sáng / Tối">🌙 Tối</button>
+      </div>
+    </header>
+
+    <!-- Status Toast -->
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+    <!-- ============================================================ -->
+    <!-- STEP 1: ROTO-BRUSH & AI CUTOUT                               -->
+    <!-- ============================================================ -->
+    <section id="viewCut" class="workspace-panel active" role="tabpanel">
+      <div class="split-layout">
+        <!-- Left Canvas Column -->
+        <div class="stage-col">
+          <div class="toolbar">
+            <div class="tool-group">
+              <button type="button" id="btnAutoBirefnet" class="btn btn-primary btn-sm">✨ Tự tách AI 1-Click</button>
+              <button type="button" id="btnAutoHands" class="btn btn-secondary btn-sm">🎯 AI Toàn diện</button>
+              <button type="button" id="btnAutoChroma" class="btn btn-secondary btn-sm">🟩 Phông xanh</button>
+            </div>
+            <div class="tool-sep" aria-hidden="true"></div>
+            <div class="tool-group">
+              <button type="button" id="btnBrushBox" class="btn btn-tool" data-brush="box" title="Kéo khung chữ nhật quanh bất kỳ chủ thể nào (người, sách, sản phẩm...) để AI tự tách chuẩn">⬜ Khoanh vùng</button>
+              <button type="button" id="btnBrushFg" class="btn btn-tool active" data-brush="fg" title="Cọ Xanh: Giữ lại vùng chọn">🟢 Giữ lại</button>
+              <button type="button" id="btnBrushBg" class="btn btn-tool" data-brush="bg" title="Cọ Đỏ: Xóa vùng dư thông minh SAM 2.1">🔴 Xóa thông minh</button>
+              <label class="inline-range" title="Kích thước nét cọ">
+                <span>Cỡ cọ</span>
+                <input type="range" id="brushSizeInput" min="4" max="72" step="2" value="22" />
+                <span id="brushSizeVal" class="mono">22px</span>
+              </label>
+              <label class="check-row compact" title="Tự động bắt chính xác tay/thiết bị ngay khi nhả chuột">
+                <input type="checkbox" id="chkAutoApplyBrush" checked />
+                <span>⚡ Tự bắt nét</span>
+              </label>
+              <button type="button" id="btnApplyStrokes" class="btn btn-accent btn-sm">🖌️ Áp dụng nét</button>
+              <button type="button" id="btnUndoMask" class="btn btn-ghost btn-sm" title="Hoàn tác nét trước">↩ Hoàn tác</button>
+              <button type="button" id="btnResetMask" class="btn btn-ghost btn-sm" title="Xóa vùng chọn của khung hiện tại">🔄 Xóa</button>
+            </div>
+            <div class="tool-group ml-auto">
+              <div class="seg-control" role="group" aria-label="Chế độ hiển thị mask">
+                <button type="button" class="seg-btn active" data-cutview="overlay">Phủ xanh</button>
+                <button type="button" class="seg-btn" data-cutview="cutout">Nền caro</button>
+                <button type="button" class="seg-btn" data-cutview="alpha">Alpha B&amp;W</button>
+              </div>
+              <button type="button" id="cutZoomFitBtn" class="btn btn-ghost btn-xs">Fit</button>
+              <button type="button" id="cutZoom2xBtn" class="btn btn-ghost btn-xs">2×</button>
+            </div>
+          </div>
+
+          <div class="canvas-stage" id="cutStage">
+            <canvas id="cutCanvas"></canvas>
+            <div id="cutEmptyOverlay" class="empty-overlay">
+              <div class="empty-card">
+                <div class="empty-icon">🎬</div>
+                <h3>Tải Video hoặc Ảnh Gốc lên để bắt đầu</h3>
+                <p>Hỗ trợ tải file dung lượng lớn từ máy tính khác qua kết nối phân mảnh an toàn.</p>
+                <button type="button" id="btnPickSourceHero" class="btn btn-primary">📂 Chọn Video / Ảnh từ máy</button>
+              </div>
+            </div>
+            <div id="cutZoomBadge" class="canvas-badge">1.0× · Lăn chuột Zoom · Space+Kéo Di chuyển</div>
+          </div>
+
+          <div class="scrubber-bar">
+            <label class="scrub-label">Khung hình:</label>
+            <input type="range" id="cutFrameSlider" min="0" max="0" step="1" value="0" />
+            <span id="cutFrameText" class="mono scrub-readout">0 / 0</span>
+            <div id="confirmedPills" class="keyframe-pills"></div>
+          </div>
+        </div>
+
+        <!-- Right Sidebar Column -->
+        <aside class="inspector-col">
+          <div class="card">
+            <div class="card-head">
+              <h4>1. Video / Ảnh Gốc (Chủ thể)</h4>
+              <span id="srcMetaTag" class="badge">Chưa có file</span>
+            </div>
+            <div id="srcDropZone" class="dropzone">
+              <input type="file" id="srcFileInput" accept="video/*,image/*" hidden />
+              <p class="drop-title">Kéo thả hoặc bấm để chọn Video / Ảnh</p>
+              <p class="drop-sub">MP4, MOV, MKV, PNG, JPG — tự động chia nhỏ khi upload từ xa</p>
+            </div>
+            <div id="srcProgressWrap" class="upload-progress" hidden>
+              <div class="progress-track"><div id="srcProgressFill" class="progress-fill"></div></div>
+              <span id="srcProgressText" class="mono small-note">0%</span>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <h4>2. Engine AI Tách Biên</h4>
+            </div>
+            <label class="field">
+              <span>Mô hình tách nền &amp; Tracking</span>
+              <select id="engineSelect">
+                <option value="matanyone2" selected>MatAnyone 2 + ViTMatte (Tốt nhất Video)</option>
+                <option value="birefnet">BiRefNet HR-Matting (1-Click Sạch nhất)</option>
+                <option value="vitmatte">ViTMatte-Base + SAM 2.1 (Roto-Brush)</option>
+                <option value="classic">Classic CPU (Siêu nhẹ)</option>
+              </select>
+            </label>
+            <label class="check-row">
+              <input type="checkbox" id="chkPyMatting" checked />
+              <span>Bóc màu viền vật lý PyMatting (Khử Halo)</span>
+            </label>
+            <label class="check-row">
+              <input type="checkbox" id="chkSmartRed" checked />
+              <span>Cọ Đỏ thông minh (SAM 2.1 trừ chi tiết)</span>
+            </label>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <h4>3. Thao Tác Nhanh</h4>
+            </div>
+            <div class="stack-actions">
+              <button type="button" id="btnDownloadCutout" class="btn btn-secondary">📥 Tải PNG Tách Nền (RGBA)</button>
+              <button type="button" id="btnGoPrompt" class="btn btn-secondary">📐 Bước 2: Tạo Prompt Bối Cảnh ➜</button>
+              <button type="button" id="btnGoComposite" class="btn btn-primary">🎨 Bước 3: Ghép Nền &amp; Live Preview ➜</button>
+            </div>
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <!-- ============================================================ -->
+    <!-- STEP 2: OPTICAL MULTI-FRAME ANALYZER & BACKGROUND PROMPT     -->
+    <!-- ============================================================ -->
+    <section id="viewPrompt" class="workspace-panel" role="tabpanel" hidden>
+      <div class="prompt-page">
+        <div class="card prompt-hero">
+          <div class="prompt-hero-head">
+            <div>
+              <h3>Phân Tích Quang Học Đa Khung Hình &amp; Thiết Kế Prompt Bối Cảnh Khớp 100%</h3>
+              <p class="small-note">Hệ thống tự lấy mẫu nhiều khung hình từ video gốc để đo kích thước chủ thể, tiêu cự ống kính, góc nghiêng máy, hướng sáng, chiều đổ bóng, độ mờ hậu cảnh và độ rung máy quay.</p>
+            </div>
+            <div class="prompt-hero-actions">
+              <label class="check-row compact">
+                <input type="checkbox" id="chkVisionAi" checked />
+                <span>Dùng Vision AI soi cảnh</span>
+              </label>
+              <label class="check-row compact">
+                <input type="checkbox" id="chkLocalLlm" checked />
+                <span>AI Local tinh chỉnh Prompt</span>
+              </label>
+              <button type="button" id="btnAnalyzePrompts" class="btn btn-primary">🔍 Phân tích Frame &amp; Tạo Prompt</button>
+            </div>
+          </div>
+          <div id="sampledThumbs" class="sampled-strip"></div>
+        </div>
+
+        <div id="telemetryGrid" class="telemetry-grid"></div>
+
+        <div class="card">
+          <div class="card-head">
+            <h4>Ý Tưởng Bối Cảnh Mới</h4>
+            <span class="small-note">Chọn nhanh gợi ý hoặc nhập bối cảnh bạn muốn đổi sang</span>
+          </div>
+          <div class="chip-row" id="bgPresets">
+            <button type="button" class="chip" data-bg="Phòng đọc sách / thư viện ấm áp có kệ sách gỗ mờ nhẹ ở xa, ánh sáng tự nhiên qua cửa sổ">📚 Thư Viện / Đọc Sách</button>
+            <button type="button" class="chip" data-bg="Sảnh sân bay quốc tế hiện đại, không gian rộng thoáng, ánh sáng ban ngày tự nhiên, hành khách kéo vali ở xa">✈️ Sảnh Sân Bay</button>
+            <button type="button" class="chip" data-bg="Quầy bán linh kiện và sửa chữa điện tử sầm uất ở Thâm Quyến, bàn nhiều linh kiện nhỏ và đèn trần ấm tự nhiên">🔌 Chợ Điện Tử</button>
+            <button type="button" class="chip" data-bg="Quán cà phê kính hiện đại tại Tokyo, ánh nắng dịu buổi sáng qua cửa kính, bàn gỗ và khách ngồi mờ nhẹ phía xa">☕ Cafe Tokyo</button>
+            <button type="button" class="chip" data-bg="Sảnh khách sạn 5 sao sang trọng, sàn đá marble phản chiếu nhẹ và đèn trần ấm tự nhiên">🏨 Khách Sạn 5 Sao</button>
+            <button type="button" class="chip" data-bg="Phố đi bộ hiện đại ban ngày, hàng cây và cửa hàng phía sau có người đi bộ ở xa">🚶 Phố Đi Bộ</button>
+            <button type="button" class="chip" data-bg="Hàng ghế sau ô tô / taxi hiện đại đang di chuyển trên phố ban ngày, ánh sáng tự nhiên qua kính cửa sổ">🚕 Ghế Sau Taxi</button>
+          </div>
+          <div class="prompt-inputs-grid">
+            <label class="field">
+              <span>Mô tả bối cảnh muốn tạo (Tiếng Việt)</span>
+              <textarea id="targetBgText" rows="2">Quán cà phê kính hiện đại, ánh sáng tự nhiên dịu qua cửa sổ, bàn gỗ và không gian có chiều sâu</textarea>
+            </label>
+            <label class="field">
+              <span>Chủ thể giữ nguyên (KEEP — tùy chọn)</span>
+              <textarea id="subjectDescText" rows="2" placeholder="Ví dụ: người ngồi đọc sách, hai bàn tay cầm sách, sản phẩm trên bàn... hoặc để trống để AI tự nhận diện"></textarea>
+            </label>
+          </div>
+        </div>
+
+        <div class="prompt-outputs-grid">
+          <div class="card prompt-out-card">
+            <div class="card-head">
+              <h4>Prompt 1 · Video Nền Sạch (Google Flow / Veo 3 — Khuyên dùng)</h4>
+              <button type="button" class="btn btn-secondary btn-xs copy-btn" data-copy="outCleanPrompt">📋 Copy</button>
+            </div>
+            <textarea id="outCleanPrompt" rows="7" readonly placeholder="Bấm 'Phân tích Frame & Tạo Prompt' ở trên..."></textarea>
+          </div>
+          <div class="card prompt-out-card">
+            <div class="card-head">
+              <h4>Prompt 2 · Google Flow Omni 1.2 (Video-to-Video)</h4>
+              <button type="button" class="btn btn-secondary btn-xs copy-btn" data-copy="outV2vPrompt">📋 Copy</button>
+            </div>
+            <textarea id="outV2vPrompt" rows="7" readonly placeholder="Prompt giữ tay + thay nền trực tiếp trên Flow V2V..."></textarea>
+          </div>
+          <div class="card prompt-out-card">
+            <div class="card-head">
+              <h4>Prompt 3 · Ảnh Nền Tĩnh Chuẩn Phối Cảnh</h4>
+              <button type="button" class="btn btn-secondary btn-xs copy-btn" data-copy="outStillPrompt">📋 Copy</button>
+            </div>
+            <textarea id="outStillPrompt" rows="7" readonly placeholder="Prompt tạo ảnh nền tĩnh khớp tiêu cự và hướng sáng..."></textarea>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================================================ -->
+    <!-- STEP 3: LIVE SPLIT-WIPE PREVIEW & REMOTE EXPORT              -->
+    <!-- ============================================================ -->
+    <section id="viewComposite" class="workspace-panel" role="tabpanel" hidden>
+      <div class="split-layout comp-layout">
+        <!-- Left Interactive Before/After Stage -->
+        <div class="stage-col">
+          <div class="toolbar">
+            <div class="tool-group">
+              <div class="seg-control" id="diagModeGroup" role="group" aria-label="Chế độ soi lỗi">
+                <button type="button" class="seg-btn active" data-diag="split">Gốc ⟷ Ghép</button>
+                <button type="button" class="seg-btn" data-diag="halo_black">Halo Đen</button>
+                <button type="button" class="seg-btn" data-diag="halo_white">Halo Trắng</button>
+                <button type="button" class="seg-btn" data-diag="screen_mask">Mask Màn Hình</button>
+              </div>
+            </div>
+            <div class="tool-group ml-auto">
+              <button type="button" class="btn btn-ghost btn-xs comp-zoom-preset" data-zoom="1" data-px="0.5" data-py="0.5">Fit</button>
+              <button type="button" class="btn btn-ghost btn-xs comp-zoom-preset" data-zoom="2" data-px="0.5" data-py="0.5">2×</button>
+              <button type="button" class="btn btn-ghost btn-xs comp-zoom-preset" data-zoom="3" data-px="0.5" data-py="0.5">3×</button>
+              <button type="button" class="btn btn-ghost btn-xs comp-zoom-preset" data-zoom="3" data-px="0.5" data-py="0.82">🔍 Chi tiết dưới</button>
+              <button type="button" class="btn btn-ghost btn-xs comp-zoom-preset" data-zoom="3" data-px="0.5" data-py="0.18">🔍 Chi tiết trên</button>
+            </div>
+          </div>
+
+          <div class="canvas-stage" id="compStage">
+            <canvas id="compCanvas"></canvas>
+            <div id="compEmptyOverlay" class="empty-overlay">
+              <div class="empty-card">
+                <div class="empty-icon">🖼️</div>
+                <h3>Hãy tải Nền Mới &amp; tách chủ thể ở Bước 1</h3>
+                <p>Kéo thanh trượt bất kỳ bên phải để thấy hiệu ứng ánh sáng áp trực tiếp ngay lên khung hình.</p>
+              </div>
+            </div>
+            <div id="compZoomBadge" class="canvas-badge">1.0× · Kéo vạch chia để so sánh · Lăn chuột Zoom</div>
+          </div>
+
+          <div class="scrubber-bar">
+            <label class="scrub-label">Khung hình:</label>
+            <input type="range" id="compFrameSlider" min="0" max="0" step="1" value="0" />
+            <span id="compFrameText" class="mono scrub-readout">0 / 0</span>
+            <label class="check-row compact ml-auto">
+              <input type="checkbox" id="chkLivePreview" checked />
+              <span>⚡ Live Preview</span>
+            </label>
+            <button type="button" id="btnRefreshPreview" class="btn btn-secondary btn-xs">👁️ Làm mới</button>
+          </div>
+        </div>
+
+        <!-- Right Inspector (Clean Fixed-Width Panel, Zero Overlap) -->
+        <aside class="inspector-col comp-inspector">
+          <div class="card compact-card">
+            <div class="card-head">
+              <h4>Video / Ảnh Nền Mới</h4>
+              <span id="bgMetaTag" class="badge">Mặc định</span>
+            </div>
+            <div id="bgDropZone" class="dropzone compact-drop">
+              <input type="file" id="bgFileInput" accept="video/*,image/*" hidden />
+              <p class="drop-title">📂 Chọn Video / Ảnh nền mới từ máy</p>
+            </div>
+            <div id="bgProgressWrap" class="upload-progress" hidden>
+              <div class="progress-track"><div id="bgProgressFill" class="progress-fill"></div></div>
+              <span id="bgProgressText" class="mono small-note">0%</span>
+            </div>
+          </div>
+
+          <div class="inspector-tabs" role="tablist">
+            <button type="button" class="itab active" data-itab="light">🎨 Ánh sáng</button>
+            <button type="button" class="itab" data-itab="edge">✂️ Viền &amp; AI</button>
+            <button type="button" class="itab" data-itab="export">🎬 Xuất Video</button>
+          </div>
+
+          <!-- TAB: LIGHT -->
+          <div class="itab-pane active" data-pane="light">
+            <div class="slider-list">
+              <label class="slider-row">
+                <div class="slider-head"><span>Khớp nhiệt độ màu Lab</span><span class="mono val" data-val-for="slAmbient">0.68</span></div>
+                <input type="range" id="slAmbient" class="live-param" min="0" max="1" step="0.04" value="0.68" />
+              </label>
+              <label class="slider-row">
+                <div class="slider-head"><span>Khớp hướng sáng 2D</span><span class="mono val" data-val-for="slDirLight">0.45</span></div>
+                <input type="range" id="slDirLight" class="live-param" min="0" max="1" step="0.04" value="0.45" />
+              </label>
+              <label class="slider-row">
+                <div class="slider-head"><span>Cân bằng điểm đen &amp; Tương phản</span><span class="mono val" data-val-for="slBlackPoint">0.35</span></div>
+                <input type="range" id="slBlackPoint" class="live-param" min="0" max="1" step="0.05" value="0.35" />
+              </label>
+              <label class="slider-row">
+                <div class="slider-head"><span>Bán kính đổ bóng mép viền (px)</span><span class="mono val" data-val-for="slLwRad">4</span></div>
+                <input type="range" id="slLwRad" class="live-param" min="0" max="15" step="1" value="4" />
+              </label>
+              <label class="slider-row">
+                <div class="slider-head"><span>Cường độ ánh sáng bọc viền</span><span class="mono val" data-val-for="slLwStr">0.65</span></div>
+                <input type="range" id="slLwStr" class="live-param" min="0" max="1" step="0.04" value="0.65" />
+              </label>
+              <label class="slider-row">
+                <div class="slider-head"><span>Độ bóng kính màn hình</span><span class="mono val" data-val-for="slGlare">0.06</span></div>
+                <input type="range" id="slGlare" class="live-param" min="0" max="0.4" step="0.02" value="0.06" />
+              </label>
+              <label class="slider-row">
+                <div class="slider-head"><span>Hạt nhiễu cảm biến (Grain)</span><span class="mono val" data-val-for="slGrain">0.12</span></div>
+                <input type="range" id="slGrain" class="live-param" min="0" max="0.5" step="0.03" value="0.12" />
+              </label>
+              <label class="slider-row">
+                <div class="slider-head"><span>Làm mềm hậu cảnh (px)</span><span class="mono val" data-val-for="slBgDefocus">0.6</span></div>
+                <input type="range" id="slBgDefocus" class="live-param" min="0" max="15" step="0.2" value="0.6" />
+              </label>
+            </div>
+            <div class="check-grid">
+              <label class="check-row"><input type="checkbox" id="chkProtectScreen" class="live-param" checked /><span>Bảo vệ vùng tự phát sáng (màn hình / đèn)</span></label>
+              <label class="check-row"><input type="checkbox" id="chkLinearComp" class="live-param" checked /><span>Ghép Linear-RGB chống viền tối</span></label>
+              <label class="check-row"><input type="checkbox" id="chkCleanGhost" class="live-param" /><span>Xóa bóng AI ở nền (Ghost Inpaint)</span></label>
+            </div>
+          </div>
+
+          <!-- TAB: EDGE & AI -->
+          <div class="itab-pane" data-pane="edge">
+            <div class="slider-list">
+              <label class="slider-row">
+                <div class="slider-head"><span>Bảo toàn pixel viền gốc</span><span class="mono val" data-val-for="slEdgePreserve">0.45</span></div>
+                <input type="range" id="slEdgePreserve" class="live-param" min="0" max="1" step="0.05" value="0.45" />
+              </label>
+              <label class="slider-row">
+                <div class="slider-head"><span>Khử màu viền nền cũ (PyMatting)</span><span class="mono val" data-val-for="slDecont">0.95</span></div>
+                <input type="range" id="slDecont" class="live-param" min="0" max="1" step="0.04" value="0.95" />
+              </label>
+              <label class="slider-row">
+                <div class="slider-head"><span>Bán kính tinh chỉnh biên (px)</span><span class="mono val" data-val-for="slTrimap">8</span></div>
+                <input type="range" id="slTrimap" class="live-param" min="1" max="24" step="1" value="8" />
+              </label>
+              <label class="slider-row">
+                <div class="slider-head"><span>Làm mịn Guided Filter (px)</span><span class="mono val" data-val-for="slGuided">2</span></div>
+                <input type="range" id="slGuided" class="live-param" min="0" max="10" step="1" value="2" />
+              </label>
+              <label class="slider-row">
+                <div class="slider-head"><span>Co / Giãn viền biên (px)</span><span class="mono val" data-val-for="slErode">0</span></div>
+                <input type="range" id="slErode" class="live-param" min="-6" max="6" step="0.5" value="0" />
+              </label>
+              <label class="slider-row">
+                <div class="slider-head"><span>Khớp độ mềm mép viền (px)</span><span class="mono val" data-val-for="slEdgeBlur">0.0</span></div>
+                <input type="range" id="slEdgeBlur" class="live-param" min="0" max="4" step="0.2" value="0.0" />
+              </label>
+            </div>
+            <label class="field" style="margin-top:8px">
+              <span>Độ phân giải nội bộ MatAnyone 2</span>
+              <select id="selMatRes">
+                <option value="480">480p — Siêu nhanh (~25–40s cho clip 12s)</option>
+                <option value="720" selected>720p — Cân bằng HD (Khuyên dùng, ~55–75s)</option>
+                <option value="1080">1080p — Chi tiết tối đa (Chậm hơn)</option>
+                <option value="-1">Full Gốc</option>
+              </select>
+            </label>
+            <div class="check-grid">
+              <label class="check-row"><input type="checkbox" id="chkDespill" class="live-param" /><span>Ép khử ám xanh lá (Despill)</span></label>
+              <label class="check-row"><input type="checkbox" id="chkPass2Legacy" class="live-param" /><span>Bật kiểm định Pass-2/Pass-3 cũ</span></label>
+            </div>
+          </div>
+
+          <!-- TAB: EXPORT -->
+          <div class="itab-pane" data-pane="export">
+            <label class="field">
+              <span>Chế độ Tracking Camera</span>
+              <select id="selTracking">
+                <option value="Camera Motion Lock" selected>Camera Motion Lock (Khóa rung tay gốc)</option>
+                <option value="Flow V2V Spatial Sync">Flow V2V Spatial Sync (Đồng bộ V2V)</option>
+                <option value="Lock 1:1">Lock 1:1 (Giữ chuyển động nền)</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Nguồn âm thanh xuất ra</span>
+              <select id="selAudio">
+                <option value="source" selected>Giữ âm thanh Video Gốc</option>
+                <option value="background">Lấy âm thanh Video Nền Mới</option>
+                <option value="none">Không âm thanh</option>
+              </select>
+            </label>
+
+            <label class="check-row" style="margin-bottom:8px">
+              <input type="checkbox" id="chkAutoQaHeal" checked />
+              <span>🛡️ Tự động QA quét 10% frame &amp; vá lỗi khuyết/thừa</span>
+            </label>
+
+            <button type="button" id="btnRenderFinal" class="btn btn-primary btn-block">🎬 Xuất Video Hoàn Chỉnh (MP4)</button>
+
+            <div id="renderJobBox" class="render-job-box" hidden>
+              <div class="progress-track"><div id="renderProgressFill" class="progress-fill"></div></div>
+              <p id="renderStatusMsg" class="small-note">Đang khởi tạo...</p>
+            </div>
+
+            <div id="qaReportBox" class="qa-report-box" hidden>
+              <div class="qa-head">
+                <strong>🛡️ Kiểm định QA 10% Frame</strong>
+                <span id="qaScoreBadge" class="badge ok">100%</span>
+              </div>
+              <p id="qaSummaryMsg" class="small-note"></p>
+              <div id="qaThumbGrid" class="qa-thumb-grid"></div>
+            </div>
+
+            <div id="downloadBox" class="download-box" hidden>
+              <a id="downloadVideoLink" class="btn btn-success btn-block" href="#" download="AGY_TachNen_GhepCanh.mp4">
+                ⬇️ Tải Video Về Máy &amp; Tự Xóa Dữ Liệu Máy Chủ
+              </a>
+              <p class="small-note">Ngay khi quá trình tải xuống hoàn tất, toàn bộ video gốc, frame tách và bản dựng trên máy chủ sẽ tự động được xóa sạch.</p>
+            </div>
+          </div>
+        </aside>
+      </div>
+    </section>
+  </div>
+
+  <script src="./static/app.js"></script>
+</body>
+</html>

@@ -15,6 +15,7 @@ from src.alpha_matting import (
     auto_chroma_key_mask,
     decontaminate_foreground_edges,
     detect_active_frame_box,
+    expand_mask_with_color_evidence,
     extract_pixel_accurate_matte,
     stabilize_alpha_temporal,
 )
@@ -41,6 +42,25 @@ def test_active_frame_detection_on_pillarbox() -> None:
     x0, y0, x1, y1 = box
     assert abs(x0 - 350) <= 4 and abs(x1 - 674) <= 4
     assert y0 == 0 and y1 == 576
+
+
+def test_evidence_gated_one_pixel_margin_recovers_silver_and_rejects_background() -> None:
+    h, w = 80, 100
+    image = np.full((h, w, 3), (42, 104, 164), dtype=np.uint8)  # Adjacent warm background
+    image[20:60, 20:50] = (28, 28, 28)  # Device body
+    image[20:60, 50] = (220, 220, 220)  # Missing neutral silver trim
+    mask = np.zeros((h, w), dtype=np.uint8)
+    mask[20:60, 20:50] = 1
+
+    grown, recovered_silver = expand_mask_with_color_evidence(image, mask, pixels=1)
+    assert np.all(grown[25:55, 50] > 0)
+    assert np.all(recovered_silver[25:55, 50])
+    assert np.all(grown[25:55, 51] == 0)
+
+    image[20:60, 50] = image[20:60, 51]  # Same-color old background at the edge
+    bg_grown, bg_silver = expand_mask_with_color_evidence(image, mask, pixels=1)
+    assert np.all(bg_grown[25:55, 50] == 0)
+    assert not np.any(bg_silver)
 
 
 def test_subpixel_alpha_matting_and_decontamination() -> None:

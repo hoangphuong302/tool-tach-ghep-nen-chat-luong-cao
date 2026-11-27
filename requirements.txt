@@ -9,3 +9,12 @@ numpy>=1.26.4,<2.3.0
 Pillow>=10.0.0
 transformers>=4.45.0
 pymatting>=1.1.12
+timm>=1.0.0
+einops>=0.8.0
+kornia>=0.7.0
+accelerate>=1.0.0
+imageio>=2.30.0
+easydict>=1.10
+gdown>=5.0.0
+av>=12.0.0
+# MatAnyone 2 (non-commercial research license): cloned into third_party/MatAnyone2

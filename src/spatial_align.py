@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -395,6 +396,23 @@ def warp_ai_frame(
     return warped_ai, warped_occ
 
 
+def _prep_cam_track_pair(
+    src_path: Path, mask_path: Path, scale_down: float
+) -> Tuple[np.ndarray, np.ndarray]:
+    from src.video_io import load_mask
+
+    bgr = cv2.imread(str(src_path))
+    m_fg = load_mask(mask_path)
+    h, w = bgr.shape[:2]
+    eff_scale = 0.35 if (scale_down == 0.5 and max(h, w) > 1000) else float(scale_down)
+    sw, sh = max(120, int(w * eff_scale)), max(120, int(h * eff_scale))
+    gray = cv2.resize(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY), (sw, sh), interpolation=cv2.INTER_AREA)
+    fg_s = cv2.resize((m_fg > 0).astype(np.uint8) * 255, (sw, sh), interpolation=cv2.INTER_NEAREST)
+    fg_dil = cv2.dilate(fg_s, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)), iterations=1)
+    bg_mask = (fg_dil == 0).astype(np.uint8) * 255
+    return gray, bg_mask
+
+
 def estimate_source_camera_trajectory(
     src_frames: List[Path],
     fg_masks: List[Path],
@@ -406,51 +424,45 @@ def estimate_source_camera_trajectory(
     from Google Flow can be locked 1:1 to the cameraman's physical lens movement.
     Returns cumulative camera transform per frame relative to a smoothed center trajectory.
     """
-    from src.video_io import load_mask
-
     n = min(len(src_frames), len(fg_masks))
     if n == 0:
         return []
+
+    first = cv2.imread(str(src_frames[0]))
+    eff_scale = 0.35 if (first is not None and scale_down == 0.5 and max(first.shape[:2]) > 1000) else float(scale_down)
 
     dx_list, dy_list, da_list, ds_list = [0.0], [0.0], [0.0], [1.0]
     prev_gray: Optional[np.ndarray] = None
     prev_bg_mask: Optional[np.ndarray] = None
 
-    for t in range(n):
-        bgr = cv2.imread(str(src_frames[t]))
-        m_fg = load_mask(fg_masks[t])
-        h, w = bgr.shape[:2]
-        sw, sh = max(120, int(w * scale_down)), max(120, int(h * scale_down))
-        gray = cv2.resize(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY), (sw, sh), interpolation=cv2.INTER_AREA)
-        fg_s = cv2.resize((m_fg > 0).astype(np.uint8) * 255, (sw, sh), interpolation=cv2.INTER_NEAREST)
-        # Dilate foreground mask so we never track features on moving fingers/device edges
-        fg_dil = cv2.dilate(fg_s, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)), iterations=1)
-        bg_mask = (fg_dil == 0).astype(np.uint8) * 255
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        for t, (gray, bg_mask) in enumerate(
+            pool.map(lambda i: _prep_cam_track_pair(src_frames[i], fg_masks[i], eff_scale), range(n))
+        ):
+            if prev_gray is not None and prev_bg_mask is not None:
+                pts0 = cv2.goodFeaturesToTrack(prev_gray, maxCorners=240, qualityLevel=0.01, minDistance=7, mask=prev_bg_mask)
+                tx, ty, ang, sc = 0.0, 0.0, 0.0, 1.0
+                if pts0 is not None and len(pts0) >= 8:
+                    pts1, st, _ = cv2.calcOpticalFlowPyrLK(prev_gray, gray, pts0, None, winSize=(21, 21), maxLevel=3)
+                    if pts1 is not None and st is not None:
+                        good0 = pts0[st.ravel() == 1]
+                        good1 = pts1[st.ravel() == 1]
+                        if len(good0) >= 8:
+                            M, inl = cv2.estimateAffinePartial2D(good0, good1, method=cv2.RANSAC, ransacReprojThreshold=3.0)
+                            if M is not None and inl is not None and int(inl.sum()) >= 6:
+                                p = TransformParams.from_matrix(M)
+                                if 0.96 <= p.scale <= 1.04 and abs(p.angle) < np.deg2rad(3.0):
+                                    tx = float(np.clip(p.tx / eff_scale, -18.0, 18.0))
+                                    ty = float(np.clip(p.ty / eff_scale, -18.0, 18.0))
+                                    ang = float(p.angle)
+                                    sc = float(p.scale)
+                dx_list.append(dx_list[-1] + tx)
+                dy_list.append(dy_list[-1] + ty)
+                da_list.append(da_list[-1] + ang)
+                ds_list.append(ds_list[-1] * sc)
 
-        if prev_gray is not None and prev_bg_mask is not None:
-            pts0 = cv2.goodFeaturesToTrack(prev_gray, maxCorners=240, qualityLevel=0.01, minDistance=7, mask=prev_bg_mask)
-            tx, ty, ang, sc = 0.0, 0.0, 0.0, 1.0
-            if pts0 is not None and len(pts0) >= 8:
-                pts1, st, _ = cv2.calcOpticalFlowPyrLK(prev_gray, gray, pts0, None, winSize=(21, 21), maxLevel=3)
-                if pts1 is not None and st is not None:
-                    good0 = pts0[st.ravel() == 1]
-                    good1 = pts1[st.ravel() == 1]
-                    if len(good0) >= 8:
-                        M, inl = cv2.estimateAffinePartial2D(good0, good1, method=cv2.RANSAC, ransacReprojThreshold=3.0)
-                        if M is not None and inl is not None and int(inl.sum()) >= 6:
-                            p = TransformParams.from_matrix(M)
-                            if 0.96 <= p.scale <= 1.04 and abs(p.angle) < np.deg2rad(3.0):
-                                tx = float(np.clip(p.tx / scale_down, -18.0, 18.0))
-                                ty = float(np.clip(p.ty / scale_down, -18.0, 18.0))
-                                ang = float(p.angle)
-                                sc = float(p.scale)
-            dx_list.append(dx_list[-1] + tx)
-            dy_list.append(dy_list[-1] + ty)
-            da_list.append(da_list[-1] + ang)
-            ds_list.append(ds_list[-1] * sc)
-
-        prev_gray = gray
-        prev_bg_mask = bg_mask
+            prev_gray = gray
+            prev_bg_mask = bg_mask
 
     # High-pass filter the cumulative trajectory around zero so the camera shake/parallax is transferred
     # without drifting off-canvas over long clips

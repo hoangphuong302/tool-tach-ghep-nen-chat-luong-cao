@@ -7,14 +7,19 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 
-# Heavy Runtime Workspace, Rendered Frames & Videos
+# Heavy Runtime Workspace, Rendered Frames, Test Outputs & Videos
 workspace/
+outputs/
 *.mp4
 *.mov
 *.avi
 *.mkv
+app.pyi
 
-# Model Checkpoints (auto-downloaded via download_checkpoints.py)
+# Cloned Third-Party Repo (installed/cloned during setup; contains nested .git)
+third_party/
+
+# Model Checkpoints (auto-downloaded via download_checkpoints.py / HuggingFace)
 checkpoints/*.pt
 checkpoints/*.pth
 checkpoints/*.safetensors

@@ -19,6 +19,23 @@ class RelightConfig:
     bg_defocus_sigma: float = 0.0             # Optional extra bokeh blur on new background (0..15 px)
     clean_ai_ghost: bool = False              # Inpaint/erase old AI object halo on V2V background
     pass3_aa_and_restore: bool = True         # Pass-3 Post-Composite Tangential AA & Source-Pixel Audit/Restore
+    linear_compositing: bool = False          # Composite & light-wrap in Linear RGB (eliminates dark sRGB fringes)
+    edge_blur_match: float = 0.0              # Optional foreground edge softness match (0.0..2.0 px)
+    black_point_match: float = 0.0            # Black-point & highlight roll-off match to background (0.0..1.0)
+
+
+_SRGB_TO_LIN_LUT = np.power(np.linspace(0.0, 1.0, 4096, dtype=np.float32), 2.2).astype(np.float32)
+_LIN_TO_SRGB_LUT = np.power(np.linspace(0.0, 1.0, 4096, dtype=np.float32), 1.0 / 2.2).astype(np.float32)
+
+
+def _srgb_to_linear(x: np.ndarray) -> np.ndarray:
+    idx = np.clip(x * 4095.0 + 0.5, 0.0, 4095.0).astype(np.int32)
+    return _SRGB_TO_LIN_LUT[idx]
+
+
+def _linear_to_srgb(x: np.ndarray) -> np.ndarray:
+    idx = np.clip(x * 4095.0 + 0.5, 0.0, 4095.0).astype(np.int32)
+    return _LIN_TO_SRGB_LUT[idx]
 
 
 def detect_emissive_screen_mask(bgr: np.ndarray, fg_mask: np.ndarray) -> np.ndarray:
@@ -31,37 +48,91 @@ def detect_emissive_screen_mask(bgr: np.ndarray, fg_mask: np.ndarray) -> np.ndar
     if not np.any(fg > 0):
         return np.zeros_like(fg, dtype=np.uint8)
 
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    b = bgr[..., 0].astype(np.float32)
-    g = bgr[..., 1].astype(np.float32)
-    r = bgr[..., 2].astype(np.float32)
+    h_full, w_full = fg.shape[:2]
+    max_hw = max(h_full, w_full)
+    scale = 1.0
+    if max_hw > 640:
+        scale = 640.0 / float(max_hw)
+        sw = max(64, int(round(w_full * scale)))
+        sh = max(64, int(round(h_full * scale)))
+        work_bgr = cv2.resize(bgr, (sw, sh), interpolation=cv2.INTER_AREA)
+        work_fg = cv2.resize(fg, (sw, sh), interpolation=cv2.INTER_NEAREST)
+    else:
+        work_bgr = bgr
+        work_fg = fg
+
+    hsv = cv2.cvtColor(work_bgr, cv2.COLOR_BGR2HSV)
+    b = work_bgr[..., 0].astype(np.float32)
+    g = work_bgr[..., 1].astype(np.float32)
+    r = work_bgr[..., 2].astype(np.float32)
+
+    fg_area = float(np.sum(work_fg > 0))
+    if fg_area <= 0:
+        return np.zeros_like(fg, dtype=np.uint8)
+
+    # Explicit skin-tone exclusion inside fg so convex/overlapping fingers (e.g. thumb over screen)
+    # are never bridged over by convex hulls or morphological closing.
+    is_skin_raw = (
+        (work_fg > 0)
+        & (r > g + 6.0)
+        & (g >= b - 4.0)
+        & (r > 70.0)
+        & (hsv[..., 1] > 28)
+        & ((hsv[..., 0] <= 24) | (hsv[..., 0] >= 160))
+    ).astype(np.uint8) * 255
+    n_skin, skin_labels, skin_stats, _ = cv2.connectedComponentsWithStats(is_skin_raw, connectivity=8)
+    skin_clean = np.zeros_like(work_fg, dtype=np.uint8)
+    min_skin_area = max(32 if scale < 1.0 else 120, int(fg_area * 0.0015))
+    for lbl in range(1, n_skin):
+        if skin_stats[lbl, cv2.CC_STAT_AREA] >= min_skin_area:
+            skin_clean[skin_labels == lbl] = 255
+    ks = max(3, int(round(9 * scale)) | 1)
+    k_skin = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
+    skin_protect = cv2.dilate(skin_clean, k_skin) > 0
 
     # Typical translator / phone screen: either non-skin blue/cyan/dark UI or high-contrast dark glass panel
-    # Skin has R > G > B and hue in [0..25] or [160..180]; emissive screens have either B > R or very low R/G dark glass
     is_non_skin_screen = (
-        (fg > 0)
+        (work_fg > 0)
+        & (~skin_protect)
         & (
             ((b > r + 15) & (hsv[..., 1] > 40))  # Active blue/cyan UI screen
             | ((r < 55) & (g < 55) & (b < 75))   # Dark OLED/glass bezel & screen interior
         )
     ).astype(np.uint8) * 255
 
-    k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
-    k_open = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+    kc = max(5, int(round(15 * scale)) | 1)
+    ko = max(3, int(round(7 * scale)) | 1)
+    k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (kc, kc))
+    k_open = cv2.getStructuringElement(cv2.MORPH_RECT, (ko, ko))
     closed = cv2.morphologyEx(is_non_skin_screen, cv2.MORPH_CLOSE, k_close)
+    closed[skin_protect] = 0
     opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, k_open)
 
-    # Keep the largest connected component inside the foreground if it is reasonably sized
-    contours, _ = cv2.findContours(opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    out = np.zeros_like(fg, dtype=np.uint8)
-    if contours:
-        largest = max(contours, key=cv2.contourArea)
-        fg_area = float(np.sum(fg > 0))
-        if cv2.contourArea(largest) > fg_area * 0.04:
-            hull = cv2.convexHull(largest)
-            cv2.drawContours(out, [hull], -1, 1, thickness=cv2.FILLED)
-            out &= fg
-    return out
+    # Keep the largest connected component inside the foreground and fill only
+    # strictly interior enclosed holes (text / icons), never convexHull.
+    n_cc, cc_labels, cc_stats, _ = cv2.connectedComponentsWithStats(opened, connectivity=8)
+    work_out = np.zeros_like(work_fg, dtype=np.uint8)
+    if n_cc > 1:
+        areas = cc_stats[1:, cv2.CC_STAT_AREA]
+        best_lbl = int(np.argmax(areas)) + 1
+        if cc_stats[best_lbl, cv2.CC_STAT_AREA] > fg_area * 0.04:
+            comp = (cc_labels == best_lbl).astype(np.uint8)
+            inv = (1 - comp).astype(np.uint8)
+            n_h, h_labels, h_stats, _ = cv2.connectedComponentsWithStats(inv, connectivity=4)
+            h_img, w_img = comp.shape
+            for h_lbl in range(1, n_h):
+                x, y, bw, bh, _ = h_stats[h_lbl]
+                touches_border = (x == 0) or (y == 0) or (x + bw >= w_img) or (y + bh >= h_img)
+                if not touches_border:
+                    hole_mask = h_labels == h_lbl
+                    if float(np.mean(skin_protect[hole_mask])) < 0.25:
+                        comp[hole_mask] = 1
+            work_out = comp & work_fg & (~skin_protect).astype(np.uint8)
+
+    if scale < 1.0:
+        out = cv2.resize(work_out, (w_full, h_full), interpolation=cv2.INTER_NEAREST) & fg
+        return out
+    return work_out
 
 
 def clean_ai_background_ghost(
@@ -112,26 +183,53 @@ def _transfer_ambient_lab(
         return fg_bgr
 
     fg_lab = cv2.cvtColor(fg_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-    bg_lab = cv2.cvtColor(new_bg_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-
-    bg_region = fg_mask == 0
-    if np.sum(bg_region) < 100:
-        bg_region = np.ones_like(fg_mask, dtype=bool)
-
-    fg_region = fg_mask > 0
-    if not np.any(fg_region):
+    h, w = fg_mask.shape[:2]
+    fg_region_full = fg_mask > 0
+    if not np.any(fg_region_full):
         return fg_bgr
 
-    new_bg_mean = np.mean(bg_lab[bg_region], axis=0)
-    new_bg_std = np.std(bg_lab[bg_region], axis=0) + 1e-4
+    if min(h, w) >= 320:
+        sw, sh = max(64, int(round(w * 0.25))), max(64, int(round(h * 0.25)))
+        bg_small_lab = cv2.cvtColor(cv2.resize(new_bg_bgr, (sw, sh), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2LAB).astype(np.float32)
+        fg_small_lab = cv2.cvtColor(cv2.resize(fg_bgr, (sw, sh), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2LAB).astype(np.float32)
+        fg_s = cv2.resize((fg_region_full).astype(np.uint8), (sw, sh), interpolation=cv2.INTER_NEAREST) > 0
+        outside_s = (~fg_s).astype(np.uint8)
+        if np.any(fg_s):
+            distance = cv2.distanceTransform(outside_s, cv2.DIST_L2, 5)
+            ring_width = max(3.0, min(sh, sw) * 0.08)
+            bg_s = (~fg_s) & (distance <= ring_width)
+        else:
+            bg_s = np.zeros_like(fg_s)
+        if np.sum(bg_s) < 60:
+            bg_s = ~fg_s
+        if np.sum(bg_s) < 60:
+            bg_s = np.ones_like(fg_s, dtype=bool)
+        if not np.any(fg_s):
+            fg_s = fg_region_full
+            fg_small_lab = fg_lab
+        bg_samples = bg_small_lab[bg_s]
+        fg_l_vals = fg_small_lab[fg_s, 0]
+    else:
+        bg_lab = cv2.cvtColor(new_bg_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+        outside = (~fg_region_full).astype(np.uint8)
+        distance = cv2.distanceTransform(outside, cv2.DIST_L2, 5)
+        ring_width = max(8.0, min(h, w) * 0.08)
+        bg_region = (~fg_region_full) & (distance <= ring_width)
+        if np.sum(bg_region) < 100:
+            bg_region = ~fg_region_full
+        if np.sum(bg_region) < 100:
+            bg_region = np.ones_like(fg_region_full, dtype=bool)
+        bg_samples = bg_lab[bg_region]
+        fg_l_vals = fg_lab[fg_region_full, 0]
 
-    fg_l_mean = float(np.mean(fg_lab[fg_region, 0]))
-    fg_l_std = float(np.std(fg_lab[fg_region, 0])) + 1e-4
+    new_bg_mean = np.median(bg_samples, axis=0)
+    bg_l_std = float(np.percentile(bg_samples[:, 0], 75) - np.percentile(bg_samples[:, 0], 25)) / 1.349 + 1e-4
+
+    fg_l_mean = float(np.mean(fg_l_vals))
+    fg_l_std = float(np.std(fg_l_vals)) + 1e-4
     bg_l_mean = float(new_bg_mean[0])
-    bg_l_std = float(new_bg_std[0])
 
-    out_lab = fg_lab.copy()
-    L = out_lab[..., 0]
+    L = fg_lab[..., 0]
 
     # 1. Soft-knee studio highlight compression when foreground is brighter than background
     if fg_l_mean > bg_l_mean + 8.0:
@@ -142,17 +240,17 @@ def _transfer_ambient_lab(
     target_l_mean = (1.0 - 0.28 * strength) * fg_l_mean + (0.28 * strength) * (bg_l_mean + 28.0)
     target_l_std = (1.0 - 0.28 * strength) * fg_l_std + (0.28 * strength) * bg_l_std
     L_harm = target_l_mean + (L - fg_l_mean) * np.clip(target_l_std / fg_l_std, 0.72, 1.28)
-    out_lab[..., 0] = np.clip(L_harm, 0.0, 255.0)
+    fg_lab[..., 0] = np.clip(L_harm, 0.0, 255.0)
 
     # 3. Chromatic warmth/coolness transfer: tightly bound 'a' channel so fingers NEVER turn red/magenta
     sat_scale = 1.0 - 0.08 * strength
     a_shift = np.clip(float(new_bg_mean[1]) - 128.0, -6.0, 4.0) * (strength * 0.75)
     b_shift = np.clip(float(new_bg_mean[2]) - 128.0, -24.0, 26.0) * (strength * 0.85)
 
-    out_lab[..., 1] = np.clip(128.0 + (out_lab[..., 1] - 128.0) * sat_scale + a_shift, 0.0, 255.0)
-    out_lab[..., 2] = np.clip(128.0 + (out_lab[..., 2] - 128.0) * sat_scale + b_shift, 0.0, 255.0)
+    fg_lab[..., 1] = np.clip(128.0 + (fg_lab[..., 1] - 128.0) * sat_scale + a_shift, 0.0, 255.0)
+    fg_lab[..., 2] = np.clip(128.0 + (fg_lab[..., 2] - 128.0) * sat_scale + b_shift, 0.0, 255.0)
 
-    return cv2.cvtColor(out_lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+    return cv2.cvtColor(fg_lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
 
 
 def _fast_lowpass(arr: np.ndarray, sigma_full: float, scale: float = 0.25) -> np.ndarray:
@@ -181,13 +279,26 @@ def _apply_2d_directional_lighting(
 
     h, w = fg_f.shape[:2]
     sigma = float(max(25.0, min(h, w) * 0.16))
-    bg_lum = 0.114 * new_bg_f[..., 0] + 0.587 * new_bg_f[..., 1] + 0.299 * new_bg_f[..., 2]
-    low_new_lum = _fast_lowpass(bg_lum, sigma_full=sigma, scale=0.125)
-    mean_lum = float(np.mean(low_new_lum)) + 1e-4
+    if min(h, w) < 320:
+        bg_lum = 0.114 * new_bg_f[..., 0] + 0.587 * new_bg_f[..., 1] + 0.299 * new_bg_f[..., 2]
+        lo, hi = np.percentile(bg_lum, (5.0, 95.0))
+        low_new_lum = _fast_lowpass(np.clip(bg_lum, lo, hi), sigma_full=sigma, scale=0.125)
+        mean_lum = float(np.median(low_new_lum)) + 1e-4
+        ratio = np.clip((low_new_lum + 0.08) / (mean_lum + 0.08), 0.88, 1.12)[..., None]
+    else:
+        bg_sample = new_bg_f[::4, ::4]
+        lum_sample = 0.114 * bg_sample[..., 0] + 0.587 * bg_sample[..., 1] + 0.299 * bg_sample[..., 2]
+        lo, hi = np.percentile(lum_sample, (5.0, 95.0))
+        sw, sh = max(16, int(w * 0.125)), max(16, int(h * 0.125))
+        bg_small = cv2.resize(new_bg_f, (sw, sh), interpolation=cv2.INTER_AREA)
+        bg_lum_s = np.clip(0.114 * bg_small[..., 0] + 0.587 * bg_small[..., 1] + 0.299 * bg_small[..., 2], lo, hi)
+        low_s = cv2.GaussianBlur(bg_lum_s, (0, 0), sigmaX=max(1.0, sigma * 0.125))
+        mean_lum = float(np.median(low_s)) + 1e-4
+        ratio_s = np.clip((low_s + 0.08) / (mean_lum + 0.08), 0.88, 1.12).astype(np.float32)
+        ratio = cv2.resize(ratio_s, (w, h), interpolation=cv2.INTER_LINEAR)[..., None]
 
-    ratio = np.clip((low_new_lum + 0.08) / (mean_lum + 0.08), 0.72, 1.35)[..., None]
-    relit = np.clip(fg_f * ratio, 0.0, 1.0)
-    return fg_f * (1.0 - strength) + relit * strength
+    scale_f = (1.0 - strength) + strength * ratio
+    return np.clip(fg_f * scale_f, 0.0, 1.0)
 
 
 def _apply_physical_light_wrap(
@@ -197,12 +308,7 @@ def _apply_physical_light_wrap(
     radius: int,
     strength: float,
 ) -> np.ndarray:
-    """
-    Full-Resolution Clean Outer Boundary Radiosity & Ambient Light Wrap (zero red/brown shadow smear):
-      1. Computes full-resolution SDF outward unit normal vector (Nx, Ny) pointing into the new background.
-      2. Samples full-resolution ambient background color 10px outside the boundary along (Nx, Ny).
-      3. Blends soft ambient light wrap strictly along the outer ~2.5px semi-transparent edge without dark cylindrical tinting.
-    """
+    """Add reflected ambient light with a distance falloff around the silhouette."""
     if radius <= 0 or strength <= 1e-3:
         return fg_f
 
@@ -211,32 +317,63 @@ def _apply_physical_light_wrap(
     if not np.any(m_bin > 0) or np.all(m_bin > 0):
         return fg_f
 
-    d_in = cv2.distanceTransform(m_bin, cv2.DIST_L2, 5)
-    d_out = cv2.distanceTransform(1 - m_bin, cv2.DIST_L2, 5)
-    sdf = d_in - d_out
+    bg_sample = bg_f[::4, ::4] if (h * w) > 100_000 else bg_f
+    lo, hi = np.percentile(bg_sample, (5.0, 95.0), axis=(0, 1))
+    low_bg_env = _fast_lowpass(np.clip(bg_f, lo, hi), sigma_full=12.0, scale=0.25)
 
-    # Outward 2D unit normal vector pointing into the adjacent background
-    gx = cv2.Sobel(sdf, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(sdf, cv2.CV_32F, 0, 1, ksize=3)
-    gnorm = np.sqrt(gx * gx + gy * gy + 1e-5)
-    nx = -gx / gnorm
-    ny = -gy / gnorm
+    if min(h, w) >= 512:
+        sw, sh = max(64, w // 2), max(64, h // 2)
+        m_s = cv2.resize(m_bin, (sw, sh), interpolation=cv2.INTER_NEAREST)
+        d_in = cv2.distanceTransform(m_s, cv2.DIST_L2, 5)
+        d_out = cv2.distanceTransform(1 - m_s, cv2.DIST_L2, 5)
+        sdf = (d_in - d_out) * 2.0
 
-    # Sample local background radiance 10px outside the contour at FULL resolution
-    low_bg_env = cv2.GaussianBlur(bg_f, (0, 0), sigmaX=12.0)
-    grid_x, grid_y = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
-    sample_x = np.clip(grid_x + nx * 10.0, 0.0, float(w - 1))
-    sample_y = np.clip(grid_y + ny * 10.0, 0.0, float(h - 1))
-    bg_env_local = cv2.remap(
-        low_bg_env, sample_x, sample_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE
-    )
+        gx = cv2.Sobel(sdf, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(sdf, cv2.CV_32F, 0, 1, ksize=3)
+        gnorm = np.sqrt(gx * gx + gy * gy + 1e-5)
+        nx = -gx / gnorm
+        ny = -gy / gnorm
 
-    str_f = float(np.clip(strength, 0.0, 1.0))
-    # Continuous outer ~2.5px edge wrap weight (never darkens interior finger skin)
-    alpha_blur = cv2.GaussianBlur(alpha.astype(np.float32), (0, 0), sigmaX=2.0)
-    rim_w = np.clip(alpha * (1.0 - alpha_blur) * 2.8, 0.0, 1.0)[..., None] * (0.26 * str_f)
-    out_f = fg_f * (1.0 - rim_w) + bg_env_local * rim_w
-    return np.clip(out_f, 0.0, 1.0)
+        grid_x, grid_y = np.meshgrid(np.arange(sw, dtype=np.float32), np.arange(sh, dtype=np.float32))
+        sample_x = np.clip(grid_x + nx * 5.0, 0.0, float(sw - 1))
+        sample_y = np.clip(grid_y + ny * 5.0, 0.0, float(sh - 1))
+        env_s = cv2.resize(low_bg_env, (sw, sh), interpolation=cv2.INTER_AREA)
+        bg_env_s = cv2.remap(env_s, sample_x, sample_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        falloff_s = np.clip(1.0 - (np.abs(sdf) - 0.5) / radius, 0.0, 1.0).astype(np.float32)
+
+        falloff = cv2.resize(falloff_s, (w, h), interpolation=cv2.INTER_LINEAR)
+        bg_env_local = cv2.resize(bg_env_s, (w, h), interpolation=cv2.INTER_LINEAR)
+    else:
+        d_in = cv2.distanceTransform(m_bin, cv2.DIST_L2, 5)
+        d_out = cv2.distanceTransform(1 - m_bin, cv2.DIST_L2, 5)
+        sdf = d_in - d_out
+
+        gx = cv2.Sobel(sdf, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(sdf, cv2.CV_32F, 0, 1, ksize=3)
+        gnorm = np.sqrt(gx * gx + gy * gy + 1e-5)
+        nx = -gx / gnorm
+        ny = -gy / gnorm
+
+        grid_x, grid_y = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+        sample_x = np.clip(grid_x + nx * 10.0, 0.0, float(w - 1))
+        sample_y = np.clip(grid_y + ny * 10.0, 0.0, float(h - 1))
+        bg_env_local = cv2.remap(
+            low_bg_env, sample_x, sample_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE
+        )
+        contour_distance = np.abs(sdf) - 0.5
+        falloff = np.clip(1.0 - contour_distance / radius, 0.0, 1.0)
+
+    edge_mask = falloff > 1e-3
+    if not np.any(edge_mask):
+        return fg_f
+    out = fg_f.copy()
+    fg_e = fg_f[edge_mask]
+    env_e = bg_env_local[edge_mask]
+    f_e = falloff[edge_mask]
+    headroom = 1.0 - np.max(fg_e, axis=-1)
+    gain = f_e * f_e * headroom * (0.18 * float(np.clip(strength, 0.0, 1.0)))
+    out[edge_mask] = fg_e * (1.0 + env_e * gain[..., None])
+    return out
 
 
 def _apply_screen_glass_glare(
@@ -261,6 +398,7 @@ def _match_sensor_grain(
     bg_f: np.ndarray,
     fg_mask_u8: np.ndarray,
     grain_strength: float,
+    frame_idx: Optional[int] = None,
 ) -> np.ndarray:
     global _GRAIN_TILE
     if grain_strength <= 1e-4:
@@ -271,13 +409,16 @@ def _match_sensor_grain(
     crop_bg = bg_f[max(0, cy - 128): min(h, cy + 128), max(0, cx - 128): min(w, cx + 128)]
     hp = crop_bg - cv2.GaussianBlur(crop_bg, (5, 5), 1.0)
     noise_std = min(float(np.std(hp)), 0.035)
-    if _GRAIN_TILE is None or _GRAIN_TILE.shape[0] < h or _GRAIN_TILE.shape[1] < w:
+    if _GRAIN_TILE is None or _GRAIN_TILE.shape[0] < (h + 256) or _GRAIN_TILE.shape[1] < (w + 256):
         rng = np.random.default_rng(42)
         small_tile = rng.standard_normal((256, 256, 3), dtype=np.float32)
-        reps_y = (h + 255) // 256
-        reps_x = (w + 255) // 256
-        _GRAIN_TILE = np.tile(small_tile, (reps_y, reps_x, 1))[:h, :w].copy()
-    return np.clip(fg_f + _GRAIN_TILE[:h, :w] * (noise_std * grain_strength), 0.0, 1.0)
+        reps_y = ((h + 256) + 255) // 256
+        reps_x = ((w + 256) + 255) // 256
+        _GRAIN_TILE = np.tile(small_tile, (reps_y, reps_x, 1))[: h + 256, : w + 256].copy()
+    sy = (int(frame_idx) * 73) % 256 if frame_idx is not None else 0
+    sx = (int(frame_idx) * 137) % 256 if frame_idx is not None else 0
+    tile = _GRAIN_TILE[sy : sy + h, sx : sx + w]
+    return np.clip(fg_f + tile * (noise_std * grain_strength), 0.0, 1.0)
 
 
 def verify_and_polish_composite_pass3(
@@ -294,8 +435,8 @@ def verify_and_polish_composite_pass3(
          (skin texture, fingernails, screen text) and reverts abnormal redness/darkness drift.
       B. Boundary Missing-Pixel Recovery (`0.05 < alpha < 0.88`): restores clean un-spilled
          foreground pixels from the source frame so delicate edges are never over-eroded.
-      C. Tangential Sub-Pixel Anti-Aliasing + Edge-Only Bilateral Polish: integrates 5-tap
-         Gaussian samples along the contour tangent vector to erase boundary staircases.
+      C. Tangential Sub-Pixel Anti-Aliasing: integrates 5-tap premultiplied
+         Gaussian samples along the contour to smooth the soft boundary.
     """
     h, w = comp_f.shape[:2]
     alpha_f = np.clip(alpha.astype(np.float32), 0.0, 1.0)
@@ -306,21 +447,26 @@ def verify_and_polish_composite_pass3(
     detail_restored_px = 0
     drift_reverted_px = 0
     if np.any(interior):
-        hi_orig = orig_fg_f - cv2.GaussianBlur(orig_fg_f, (0, 0), sigmaX=1.6)
-        hi_fg = fg_work - cv2.GaussianBlur(fg_work, (0, 0), sigmaX=1.6)
-        hi_diff = hi_orig - hi_fg
+        detail_delta = orig_fg_f - fg_work
+        detail_weight = cv2.GaussianBlur(alpha_f, (0, 0), sigmaX=1.6)
+        low_delta = cv2.GaussianBlur(detail_delta * alpha_f[..., None], (0, 0), sigmaX=1.6)
+        hi_diff = detail_delta - low_delta / np.maximum(detail_weight[..., None], 1e-4)
         need_detail = interior & (np.max(np.abs(hi_diff), axis=-1) > 0.006)
         detail_restored_px = int(np.sum(need_detail))
         if detail_restored_px > 0:
             fg_work[need_detail] = np.clip(fg_work[need_detail] + hi_diff[need_detail], 0.0, 1.0)
 
         # Revert unnatural red-channel drift or heavy brightness deviation back toward source foreground
-        red_drift = (fg_work[..., 2] - fg_work[..., 1]) > ((orig_fg_f[..., 2] - orig_fg_f[..., 1]) + 0.085)
-        l2_drift = np.linalg.norm(fg_work - orig_fg_f, axis=-1) > 0.28
-        aberrant = interior & (red_drift | l2_drift)
-        drift_reverted_px = int(np.sum(aberrant))
+        red_drift = (fg_work[..., 2] - fg_work[..., 1]) - (orig_fg_f[..., 2] - orig_fg_f[..., 1])
+        l2_drift = np.linalg.norm(fg_work - orig_fg_f, axis=-1)
+        red_t = np.clip((red_drift - 0.065) / 0.04, 0.0, 1.0)
+        l2_t = np.clip((l2_drift - 0.24) / 0.08, 0.0, 1.0)
+        red_weight = red_t * red_t * (3.0 - 2.0 * red_t)
+        l2_weight = l2_t * l2_t * (3.0 - 2.0 * l2_t)
+        drift_weight = np.maximum(red_weight, l2_weight) * interior * 0.65
+        drift_reverted_px = int(np.count_nonzero(drift_weight))
         if drift_reverted_px > 0:
-            fg_work[aberrant] = fg_work[aberrant] * 0.35 + orig_fg_f[aberrant] * 0.65
+            fg_work += (orig_fg_f - fg_work) * drift_weight[..., None]
 
     # B. Boundary Missing-Pixel Audit & Copy-Back from Source
     edge_restored_px = 0
@@ -339,8 +485,7 @@ def verify_and_polish_composite_pass3(
 
     # C. Sub-Pixel Tangential Contour Anti-Aliasing (5-tap MLAA along contour tangent)
     edge_core = (alpha_f > 0.005) & (alpha_f < 0.995)
-    edge_band = cv2.dilate(edge_core.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))) > 0
-    aa_polished_px = int(np.sum(edge_band))
+    aa_polished_px = int(np.sum(edge_core))
 
     if aa_polished_px > 0:
         gx = cv2.Sobel(alpha_f, cv2.CV_32F, 1, 0, ksize=3)
@@ -351,36 +496,74 @@ def verify_and_polish_composite_pass3(
         ty = -gx / gnorm
 
         lap_alpha = np.abs(cv2.Laplacian(alpha_f, cv2.CV_32F, ksize=3))
-        jagged_w = np.where(edge_band, np.clip(lap_alpha * 3.2, 0.25, 1.0), 0.0).astype(np.float32)
+        jagged_w = np.where(edge_core, np.clip(lap_alpha * 3.2, 0.25, 1.0), 0.0)[..., None]
+
+        edge_y, edge_x = np.nonzero(edge_core)
+        if aa_polished_px <= alpha_f.size * 0.40:
+            premultiplied = np.dstack((fg_work * alpha_f[..., None], alpha_f))
+            premultiplied_core = premultiplied[edge_y, edge_x]
+            gx_core = gx[edge_y, edge_x]
+            gy_core = gy[edge_y, edge_x]
+            gnorm_core = np.sqrt(gx_core * gx_core + gy_core * gy_core + 1e-6)
+            tx_core = gy_core / gnorm_core
+            ty_core = -gx_core / gnorm_core
+            jagged_w_core = np.clip(lap_alpha[edge_y, edge_x] * 3.2, 0.25, 1.0)[:, None]
+
+            accumulated_core = premultiplied_core * 0.30
+            x_core = edge_x.astype(np.float32)
+            y_core = edge_y.astype(np.float32)
+            remap_chunk_size = 32000
+            for k_step, k_wgt in ((-2, 0.12), (-1, 0.23), (1, 0.23), (2, 0.12)):
+                sx = np.clip(x_core + tx_core * (k_step * 0.75), 0.0, float(w - 1))
+                sy = np.clip(y_core + ty_core * (k_step * 0.75), 0.0, float(h - 1))
+                samples = np.empty_like(premultiplied_core)
+                for start in range(0, aa_polished_px, remap_chunk_size):
+                    end = min(start + remap_chunk_size, aa_polished_px)
+                    packed = cv2.remap(
+                        premultiplied,
+                        sx[start:end].reshape(1, -1),
+                        sy[start:end].reshape(1, -1),
+                        interpolation=cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_REPLICATE,
+                    )
+                    samples[start:end] = packed.reshape(-1, 4)
+                accumulated_core += samples * k_wgt
+
+            filtered_core = (
+                premultiplied_core * (1.0 - jagged_w_core)
+                + accumulated_core * jagged_w_core
+            )
+            comp_aa = bg_f * (1.0 - alpha_f[..., None]) + premultiplied[..., :3]
+            comp_aa[edge_y, edge_x] = (
+                bg_f[edge_y, edge_x] * (1.0 - filtered_core[:, 3:4])
+                + filtered_core[:, :3]
+            )
+            return np.clip(comp_aa * 255.0, 0, 255).astype(np.uint8), {
+                "detail_restored_px": detail_restored_px,
+                "drift_reverted_px": drift_reverted_px,
+                "edge_restored_px": edge_restored_px,
+                "aa_polished_px": aa_polished_px,
+            }
 
         grid_x, grid_y = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
-        alpha_acc = np.zeros_like(alpha_f)
-        fg_acc = np.zeros_like(fg_work)
+        # Filter color and coverage together so pixels outside the cutout
+        # contribute zero foreground color, even with bilinear sampling.
+        premultiplied = np.dstack((fg_work * alpha_f[..., None], alpha_f))
+        accumulated = np.zeros_like(premultiplied)
         taps = ((-2, 0.12), (-1, 0.23), (0, 0.30), (1, 0.23), (2, 0.12))
         for k_step, k_wgt in taps:
             if k_step == 0:
-                alpha_acc += alpha_f * k_wgt
-                fg_acc += fg_work * k_wgt
+                accumulated += premultiplied * k_wgt
             else:
                 sx = np.clip(grid_x + tx * (k_step * 0.75), 0.0, float(w - 1))
                 sy = np.clip(grid_y + ty * (k_step * 0.75), 0.0, float(h - 1))
-                alpha_acc += cv2.remap(
-                    alpha_f, sx, sy, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE
-                ) * k_wgt
-                fg_acc += cv2.remap(
-                    fg_work, sx, sy, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE
+                accumulated += cv2.remap(
+                    premultiplied, sx, sy, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE
                 ) * k_wgt
 
-        alpha_out = np.where(edge_band, alpha_f * (1.0 - jagged_w) + alpha_acc * jagged_w, alpha_f)
-        fg_out = np.where(edge_band[..., None], fg_work * (1.0 - jagged_w[..., None]) + fg_acc * jagged_w[..., None], fg_work)
-        comp_aa = bg_f * (1.0 - alpha_out[..., None]) + fg_out * alpha_out[..., None]
-
-        # Edge-only micro-bilateral polish (keeps interior skin/UI 100% razor sharp)
-        comp_u8 = np.clip(comp_aa * 255.0, 0, 255).astype(np.uint8)
-        comp_bilat = cv2.bilateralFilter(comp_u8, d=5, sigmaColor=22, sigmaSpace=3)
-        polish_zone = cv2.dilate(edge_core.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))) > 0
-        comp_u8[polish_zone] = comp_bilat[polish_zone]
-        return comp_u8, {
+        filtered = premultiplied * (1.0 - jagged_w) + accumulated * jagged_w
+        comp_aa = bg_f * (1.0 - filtered[..., 3:4]) + filtered[..., :3]
+        return np.clip(comp_aa * 255.0, 0, 255).astype(np.uint8), {
             "detail_restored_px": detail_restored_px,
             "drift_reverted_px": drift_reverted_px,
             "edge_restored_px": edge_restored_px,
@@ -397,6 +580,68 @@ def verify_and_polish_composite_pass3(
     }
 
 
+def _match_black_white_floor(
+    fg_f: np.ndarray,
+    bg_f: np.ndarray,
+    fg_mask_u8: np.ndarray,
+    strength: float,
+) -> np.ndarray:
+    """
+    Gently align foreground shadow black-point (P5) and highlight ceiling (P95)
+    toward the target background so deep shadows never look crushed or washed out,
+    while preserving original chromaticity ratios.
+    """
+    s = float(np.clip(strength, 0.0, 1.0))
+    if s <= 0.01:
+        return fg_f
+    fg_sel = fg_mask_u8 > 0
+    ys, xs = np.where(fg_sel)
+    if len(xs) < 32:
+        return fg_f
+
+    h, w = fg_f.shape[:2]
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+
+    if (h * w) > 120_000:
+        fg_sub = fg_f[y0:y1:4, x0:x1:4]
+        sel_sub = fg_sel[y0:y1:4, x0:x1:4]
+        y_fg_s = 0.114 * fg_sub[..., 0] + 0.587 * fg_sub[..., 1] + 0.299 * fg_sub[..., 2]
+        fg_vals = y_fg_s[sel_sub] if np.any(sel_sub) else y_fg_s.reshape(-1)
+        bg_sub = bg_f[::4, ::4]
+        bg_vals = (0.114 * bg_sub[..., 0] + 0.587 * bg_sub[..., 1] + 0.299 * bg_sub[..., 2]).reshape(-1)
+    else:
+        y_fg_full = 0.114 * fg_f[..., 0] + 0.587 * fg_f[..., 1] + 0.299 * fg_f[..., 2]
+        fg_vals = y_fg_full[fg_sel]
+        bg_vals = (0.114 * bg_f[..., 0] + 0.587 * bg_f[..., 1] + 0.299 * bg_f[..., 2]).reshape(-1)
+
+    fg_p5 = float(np.percentile(fg_vals, 5))
+    fg_p95 = float(np.percentile(fg_vals, 95))
+    fg_span = max(fg_p95 - fg_p5, 0.08)
+
+    bg_p5 = float(np.clip(np.percentile(bg_vals, 5), 0.02, 0.28))
+    bg_p95 = float(np.clip(np.percentile(bg_vals, 95), 0.65, 0.98))
+
+    blend = s * 0.65
+    tgt_p5 = fg_p5 * (1.0 - blend) + bg_p5 * blend
+    tgt_p95 = fg_p95 * (1.0 - blend) + bg_p95 * blend
+    tgt_span = max(tgt_p95 - tgt_p5, 0.08)
+
+    roi_fg = fg_f[y0:y1, x0:x1]
+    roi_sel = fg_sel[y0:y1, x0:x1]
+    y_roi = 0.114 * roi_fg[..., 0] + 0.587 * roi_fg[..., 1] + 0.299 * roi_fg[..., 2]
+    y_safe = np.maximum(y_roi, 1e-4)
+    y_norm = np.clip((y_roi - fg_p5) / fg_span, -0.08, 1.15)
+    y_mapped = np.clip(tgt_p5 + y_norm * tgt_span, 0.0, 1.0)
+    ratio = np.clip(y_mapped / y_safe, 0.60, 1.60)[..., None]
+
+    out = fg_f.copy()
+    mapped_roi = np.clip(roi_fg * ratio, 0.0, 1.0)
+    out_roi = out[y0:y1, x0:x1]
+    out_roi[roi_sel] = mapped_roi[roi_sel]
+    return out
+
+
 def composite_with_relighting(
     fg_clean_bgr: np.ndarray,
     alpha: np.ndarray,
@@ -404,6 +649,7 @@ def composite_with_relighting(
     src_full_bgr: Optional[np.ndarray] = None,
     screen_mask: Optional[np.ndarray] = None,
     cfg: Optional[RelightConfig] = None,
+    frame_idx: Optional[int] = None,
 ) -> np.ndarray:
     """
     Composite extracted sub-pixel foreground (hands + product) onto a new background
@@ -441,6 +687,11 @@ def composite_with_relighting(
     bg_f = bg_bgr.astype(np.float32) / 255.0
     src_f = src_full_bgr.astype(np.float32) / 255.0 if src_full_bgr is not None else None
 
+    # Stage 1B: Black-point & highlight tone-curve alignment (before Stage 4 screen protect)
+    bp_strength = float(getattr(cfg, "black_point_match", 0.0))
+    if bp_strength > 0.01:
+        fg_f = _match_black_white_floor(fg_f, bg_f, fg_mask_u8, bp_strength)
+
     # Stage 2: 2D Directional Illumination Field Transfer
     fg_f = _apply_2d_directional_lighting(
         fg_f,
@@ -450,33 +701,78 @@ def composite_with_relighting(
     )
 
     # Stage 3: Physical Edge Light-Wrap around fingers and device perimeter
-    fg_f = _apply_physical_light_wrap(
-        fg_f,
-        bg_f,
-        alpha,
-        radius=int(cfg.light_wrap_Radius),
-        strength=float(np.clip(cfg.light_wrap_strength, 0.0, 1.0)),
-    )
+    if not cfg.linear_compositing:
+        fg_f = _apply_physical_light_wrap(
+            fg_f,
+            bg_f,
+            alpha,
+            radius=int(cfg.light_wrap_Radius),
+            strength=float(np.clip(cfg.light_wrap_strength, 0.0, 1.0)),
+        )
 
-    # Stage 4: Emissive Screen Protection (keep UI text/colors crisp & true)
+    # Stage 4: Emissive Screen Protection (keep UI text/colors crisp & true, cropped to tight ROI)
     if cfg.protect_emissive_screen:
         if screen_mask is None:
             screen_mask = detect_emissive_screen_mask(fg_clean_bgr, fg_mask_u8)
         if screen_mask is not None and np.any(screen_mask > 0):
-            scr_alpha = cv2.GaussianBlur(
-                (screen_mask > 0).astype(np.float32), (9, 9), 0
-            )[..., None]
+            sy_pts, sx_pts = np.where(screen_mask > 0)
+            sy0 = max(0, int(sy_pts.min()) - 8)
+            sy1 = min(h, int(sy_pts.max()) + 9)
+            sx0 = max(0, int(sx_pts.min()) - 8)
+            sx1 = min(w, int(sx_pts.max()) + 9)
+            scr_u8 = (screen_mask[sy0:sy1, sx0:sx1] > 0).astype(np.uint8)
+            k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            scr_eroded = cv2.erode(scr_u8, k3, iterations=1)
+            scr_alpha = cv2.GaussianBlur(scr_eroded.astype(np.float32), (5, 5), 0)
+            scr_outer = cv2.dilate(scr_u8, k3, iterations=1) > 0
+            scr_alpha[~scr_outer] = 0.0
+            scr_alpha = scr_alpha[..., None]
             screen_layer = _apply_screen_glass_glare(
-                orig_fg_f, bg_f, float(np.clip(cfg.screen_glare_opacity, 0.0, 0.5))
+                orig_fg_f[sy0:sy1, sx0:sx1],
+                bg_f[sy0:sy1, sx0:sx1],
+                float(np.clip(cfg.screen_glare_opacity, 0.0, 0.5)),
             )
-            fg_f = fg_f * (1.0 - scr_alpha) + screen_layer * scr_alpha
+            fg_roi = fg_f[sy0:sy1, sx0:sx1]
+            fg_f[sy0:sy1, sx0:sx1] = fg_roi * (1.0 - scr_alpha) + screen_layer * scr_alpha
 
-    # Stage 5: Sensor Grain Matching
-    fg_f = _match_sensor_grain(fg_f, bg_f, fg_mask_u8, float(np.clip(cfg.grain_match, 0.0, 1.0)))
+    # Stage 5: Sensor Grain Matching (dynamic per frame when frame_idx is given)
+    fg_f = _match_sensor_grain(
+        fg_f,
+        bg_f,
+        fg_mask_u8,
+        float(np.clip(cfg.grain_match, 0.0, 1.0)),
+        frame_idx=frame_idx,
+    )
 
-    # Final Sub-Pixel Alpha Composite + Pass-3 Tangential AA & Source-Pixel Audit
+    # Optional subtle edge softness match to optical background
+    edge_blur = float(getattr(cfg, "edge_blur_match", 0.0))
+    if edge_blur > 0.05:
+        k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        edge_zone = cv2.dilate(((alpha > 0.01) & (alpha < 0.99)).astype(np.uint8), k3) > 0
+        if np.any(edge_zone):
+            fg_soft = cv2.GaussianBlur(fg_f, (0, 0), sigmaX=edge_blur)
+            fg_f = np.where(edge_zone[..., None], fg_soft, fg_f)
+
+    # Final Sub-Pixel Alpha Composite (Linear RGB or sRGB) + Optional Pass-3 Tangential AA
     a3 = np.clip(alpha, 0.0, 1.0)[..., None]
-    comp_f = bg_f * (1.0 - a3) + fg_f * a3
+    if cfg.linear_compositing:
+        fg_lin = _srgb_to_linear(fg_f)
+        bg_lin = _srgb_to_linear(bg_f)
+        if int(cfg.light_wrap_Radius) > 0 and float(cfg.light_wrap_strength) > 1e-3:
+            fg_lin = _apply_physical_light_wrap(
+                fg_lin,
+                bg_lin,
+                alpha,
+                radius=int(cfg.light_wrap_Radius),
+                strength=float(np.clip(cfg.light_wrap_strength, 0.0, 1.0)),
+            )
+        comp_lin = bg_lin * (1.0 - a3) + fg_lin * a3
+        comp_f = _linear_to_srgb(comp_lin)
+        if cfg.pass3_aa_and_restore:
+            fg_f = _linear_to_srgb(fg_lin)
+    else:
+        comp_f = bg_f * (1.0 - a3) + fg_f * a3
+
     if cfg.pass3_aa_and_restore:
         comp_u8, _ = verify_and_polish_composite_pass3(
             comp_f=comp_f,
