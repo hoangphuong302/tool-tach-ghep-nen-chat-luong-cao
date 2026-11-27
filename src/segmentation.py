@@ -959,30 +959,20 @@ def auto_cut_universal_hybrid(
     """
     Universal AI 1-Click Hybrid Cutout (works cleanly for ANY subject: person reading a book,
     hands + product/book/gadget, standalone products, pets, portraits):
-      1. BiRefNet_HR-matting + native edge preservation + universal structural & pinhole heal.
+      1. Pure BiRefNet_HR-matting sub-pixel alpha (zero destructive heuristic geometry overrides).
       2. Free BiRefNet RAM/VRAM, then query SAM 2.1 with the subject bounding box + interior/exterior
-         anchors to verify semantic completeness and recover any adjacent dropped object parts
-         (e.g., white book pages against light walls or straight metallic edges).
+         anchors to verify semantic completeness and recover any genuinely dropped adjacent parts
+         (e.g., white book pages against light walls) while strictly blocking background leakage.
     """
     from src.alpha_matting import refine_alpha_edge_controls
-    from src.matte_qa import heal_universal_structural_defects, is_green_screen_scene
+    from src.matte_qa import is_green_screen_scene
     from src.neural_matting import release_neural_models, run_birefnet_matting
 
     h, w = src_bgr.shape[:2]
     alpha_bi = run_birefnet_matting(src_bgr, max_size=int(max_size))
     release_neural_models()
 
-    alpha_bi = refine_alpha_edge_controls(
-        src_bgr,
-        alpha_bi,
-        erode_dilate=0.0,
-        guided_radius=2,
-        trimap_radius=6,
-        edge_preserve=0.45,
-        edge_feather=0.0,
-    )
-    alpha_bi, _, _ = heal_universal_structural_defects(src_bgr, alpha_bi)
-    mask_bi = (alpha_bi >= 0.42).astype(np.uint8)
+    mask_bi = (alpha_bi >= 0.45).astype(np.uint8)
     fg_frac = float(np.mean(mask_bi > 0))
     if fg_frac < 0.008 or fg_frac > 0.94:
         return mask_bi, alpha_bi

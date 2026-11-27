@@ -333,11 +333,11 @@ class PreviewReq(BaseModel):
     matting_engine: str = "matanyone2"
     use_pymatting_fg: bool = True
     trimap_radius: int = 8
-    guided_radius: int = 2
+    guided_radius: int = 0
     decont_strength: float = 0.95
     despill_green: bool = False
     erode_dilate: float = 0.0
-    edge_preserve: float = 0.45
+    edge_preserve: float = 0.0
     edge_blur_match: float = 0.0
     ambient_color_strength: float = 0.68
     directional_light_strength: float = 0.45
@@ -571,23 +571,31 @@ def _get_matte_and_fg(
         sess.matte_cache.move_to_end(m_key)
         return cached[0], cached[1], m_key, auto_tracked
 
+    needs_edge_refine = (
+        float(req.edge_preserve) > 0.01
+        or int(req.guided_radius) > 0
+        or abs(float(req.erode_dilate)) >= 0.05
+        or float(req.edge_blur_match) > 0.05
+    )
+
     if (
         soft_alpha is not None
         and soft_alpha.shape == (h, w)
         and (f_idx in sess.confirmed_masks or auto_tracked)
         and req.matting_engine in ("birefnet", "matanyone2")
     ):
-        base_alpha = soft_alpha
-        if float(req.edge_preserve) > 0.01 or is_green_screen_scene(src_bgr, base_alpha):
-            base_alpha, _, _ = heal_universal_structural_defects(src_bgr, base_alpha)
-        alpha = refine_alpha_edge_controls(
-            src_bgr,
-            base_alpha,
-            erode_dilate=float(req.erode_dilate),
-            guided_radius=int(req.guided_radius),
-            trimap_radius=int(req.trimap_radius),
-            edge_preserve=float(req.edge_preserve),
-            edge_feather=float(req.edge_blur_match),
+        alpha = (
+            refine_alpha_edge_controls(
+                src_bgr,
+                soft_alpha,
+                erode_dilate=float(req.erode_dilate),
+                guided_radius=int(req.guided_radius),
+                trimap_radius=int(req.trimap_radius),
+                edge_preserve=float(req.edge_preserve),
+                edge_feather=float(req.edge_blur_match),
+            )
+            if needs_edge_refine
+            else np.clip(soft_alpha.astype(np.float32), 0.0, 1.0)
         )
         effective_despill = bool(req.despill_green) or (
             float(req.decont_strength) > 0.05 and is_green_screen_scene(src_bgr, alpha)
@@ -615,27 +623,23 @@ def _get_matte_and_fg(
             bool(req.pass2_legacy),
         )
         mres = extract_pixel_accurate_matte(src_bgr, mask, mcfg)
-        base_alpha = mres.alpha
-        if float(req.edge_preserve) > 0.01 or is_green_screen_scene(src_bgr, base_alpha):
-            base_alpha, _, _ = heal_universal_structural_defects(src_bgr, base_alpha)
-        alpha = refine_alpha_edge_controls(
-            src_bgr,
-            base_alpha,
-            erode_dilate=float(req.erode_dilate),
-            guided_radius=int(req.guided_radius),
-            trimap_radius=int(req.trimap_radius),
-            edge_preserve=float(req.edge_preserve),
-            edge_feather=float(req.edge_blur_match),
+        alpha = (
+            refine_alpha_edge_controls(
+                src_bgr,
+                mres.alpha,
+                erode_dilate=float(req.erode_dilate),
+                guided_radius=int(req.guided_radius),
+                trimap_radius=int(req.trimap_radius),
+                edge_preserve=float(req.edge_preserve),
+                edge_feather=float(req.edge_blur_match),
+            )
+            if needs_edge_refine
+            else mres.alpha
         )
         effective_despill = bool(req.despill_green) or (
             float(req.decont_strength) > 0.05 and is_green_screen_scene(src_bgr, alpha)
         )
-        alpha_shifted = (
-            abs(float(req.erode_dilate)) >= 0.05
-            or float(req.edge_blur_match) > 0.05
-            or abs(float(req.edge_preserve) - 0.45) > 0.02
-            or (effective_despill and not req.despill_green)
-        )
+        alpha_shifted = needs_edge_refine or (effective_despill and not req.despill_green)
         if req.use_pymatting_fg and alpha_shifted:
             fg_clean = estimate_foreground_pymatting(
                 src_bgr,
@@ -756,15 +760,7 @@ def _run_render_job(sess: SessionState, job_id: str, req: RenderReq) -> None:
         if not confirmed:
             bgr0 = _load_bgr(src_frames[0])
             alpha0 = run_birefnet_matting(bgr0, max_size=1024)
-            alpha0 = refine_alpha_edge_controls(
-                bgr0,
-                alpha0,
-                guided_radius=2,
-                trimap_radius=6,
-                edge_preserve=float(req.edge_preserve),
-            )
-            alpha0, _, _ = heal_universal_structural_defects(bgr0, alpha0)
-            m0 = (alpha0 >= 0.42).astype(np.uint8)
+            m0 = (alpha0 >= 0.45).astype(np.uint8)
             sess.birefnet_alpha_by_frame[0] = alpha0
             p0 = _save_confirmed_mask(sess, 0, m0, push_undo=False)
             confirmed[0] = load_mask(p0)
@@ -976,21 +972,24 @@ def _run_render_job(sess: SessionState, job_id: str, req: RenderReq) -> None:
                         alpha_t = mres.alpha
                         raw_fg_opt = mres.fg_clean_bgr
 
-                alpha_t, bezel_repaired, _ = heal_universal_structural_defects(src_bgr, alpha_t)
-                alpha_t = refine_alpha_edge_controls(
-                    src_bgr,
-                    alpha_t,
-                    erode_dilate=float(req.erode_dilate),
-                    guided_radius=int(req.guided_radius),
-                    trimap_radius=int(req.trimap_radius),
-                    edge_preserve=float(req.edge_preserve),
-                    edge_feather=float(req.edge_blur_match),
-                )
-                if raw_fg_opt is not None and (
-                    bezel_repaired > 0
+                needs_edge_refine = (
+                    float(req.edge_preserve) > 0.01
+                    or int(req.guided_radius) > 0
                     or abs(float(req.erode_dilate)) >= 0.05
                     or float(req.edge_blur_match) > 0.05
-                    or float(req.edge_preserve) > 0.01
+                )
+                if needs_edge_refine:
+                    alpha_t = refine_alpha_edge_controls(
+                        src_bgr,
+                        alpha_t,
+                        erode_dilate=float(req.erode_dilate),
+                        guided_radius=int(req.guided_radius),
+                        trimap_radius=int(req.trimap_radius),
+                        edge_preserve=float(req.edge_preserve),
+                        edge_feather=float(req.edge_blur_match),
+                    )
+                if raw_fg_opt is not None and (
+                    needs_edge_refine
                     or (not req.despill_green and float(req.decont_strength) > 0.05 and is_green_screen_scene(src_bgr, alpha_t))
                 ):
                     raw_fg_opt = None
@@ -1290,8 +1289,14 @@ def auto_cut(sid: str, req: AutoCutReq):
 
         use_ai = legacy_app._is_ai_engine(_resolve_engine_label(req.engine))
         if req.mode == "chroma":
-            mask = auto_chroma_key_mask(src_bgr)
-            sess.birefnet_alpha_by_frame.pop(f_idx, None)
+            if use_ai:
+                alpha_raw = run_birefnet_matting(src_bgr, max_size=1024)
+                alpha, _, _ = heal_universal_structural_defects(src_bgr, alpha_raw, clean_green_crevices=True)
+                mask = (alpha >= 0.45).astype(np.uint8)
+                sess.birefnet_alpha_by_frame[f_idx] = alpha
+            else:
+                mask = auto_chroma_key_mask(src_bgr)
+                sess.birefnet_alpha_by_frame.pop(f_idx, None)
         elif req.mode in ("hands_product", "universal_hybrid"):
             mask, alpha = auto_cut_universal_hybrid(
                 src_bgr,
@@ -1300,16 +1305,8 @@ def auto_cut(sid: str, req: AutoCutReq):
             )
             sess.birefnet_alpha_by_frame[f_idx] = alpha
         else:
-            alpha_raw = run_birefnet_matting(src_bgr, max_size=1024)
-            alpha = refine_alpha_edge_controls(
-                src_bgr,
-                alpha_raw,
-                guided_radius=2,
-                trimap_radius=6,
-                edge_preserve=0.45,
-            )
-            alpha, _, _ = heal_universal_structural_defects(src_bgr, alpha)
-            mask = (alpha >= 0.42).astype(np.uint8)
+            alpha = run_birefnet_matting(src_bgr, max_size=1024)
+            mask = (alpha >= 0.45).astype(np.uint8)
             sess.birefnet_alpha_by_frame[f_idx] = alpha
 
         _save_confirmed_mask(sess, f_idx, mask, push_undo=True)

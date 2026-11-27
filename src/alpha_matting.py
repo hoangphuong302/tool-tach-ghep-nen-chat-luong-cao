@@ -514,7 +514,15 @@ def auto_chroma_key_mask(
     thresh_diff = max(8.0, 45.0 * (1.0 - float(np.clip(tolerance, 0.05, 0.95))))
     if mode == "green":
         chroma_excess = g - np.maximum(r, b)
-        is_bg = (chroma_excess > thresh_diff) & (hue >= 30) & (hue <= 96) & (sat >= 35) & (val >= 25)
+        core_bg = (chroma_excess > thresh_diff) & (hue >= 30) & (hue <= 96) & (sat >= 35) & (val >= 22)
+        shadow_thresh = max(10.0, thresh_diff * 0.48)
+        shadow_bg = (chroma_excess > shadow_thresh) & (hue >= 34) & (hue <= 92) & (sat >= 28) & (val >= 18) & (g > r + 8.0)
+        if np.any(core_bg):
+            # Include shadowed chroma-green folds adjacent to strong green screen
+            near_core = cv2.dilate(core_bg.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (41, 41))) > 0
+            is_bg = core_bg | (shadow_bg & near_core)
+        else:
+            is_bg = core_bg
     else:
         chroma_excess = b - np.maximum(r, g)
         is_bg = (chroma_excess > thresh_diff) & (hue >= 92) & (hue <= 140) & (sat >= 35) & (val >= 25)

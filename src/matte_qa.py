@@ -217,20 +217,21 @@ def is_green_screen_scene(bgr: np.ndarray, alpha: np.ndarray) -> bool:
 def heal_universal_structural_defects(
     bgr: np.ndarray,
     alpha: np.ndarray,
+    *,
+    clean_green_crevices: bool = False,
 ) -> Tuple[np.ndarray, int, np.ndarray]:
     """
-    Universal per-frame structural guard for ANY subject (book, person, product, gadget):
-      1. Rigid Rectangular Device Guard (`heal_device_bezel_notches`).
-      2. Color-Aware Enclosed Pinhole Guard: fills interior holes matching foreground tone,
-         without filling real exterior background gaps (e.g. room wall or green-screen slit).
-      3. Trapped Green-Screen Crevice Punch-Out: cleans shadowed green-screen gaps between
-         fingers and subject while protecting glowing device UI screens.
+    Conservative per-frame structural guard for ANY subject (book, person, product, gadget):
+      1. Color-Aware Enclosed Pinhole Guard: fills only tiny fully-enclosed interior pinholes
+         matching foreground tone, never adding convex-hull background triangles outside the subject.
+      2. Opt-in Trapped Green-Screen Crevice Punch-Out (`clean_green_crevices=True`): cleans
+         confirmed chroma-green slits between fingers/subject while protecting glowing UI screens.
     """
-    a_f, bezel_px, bezel_mask = heal_device_bezel_notches(bgr, alpha)
+    a_f = np.clip(alpha.astype(np.float32), 0.0, 1.0)
     h, w = a_f.shape[:2]
     fg_u8 = (a_f >= 0.45).astype(np.uint8)
     if min(h, w) < 32 or not np.any(fg_u8 > 0):
-        return a_f, bezel_px, bezel_mask
+        return a_f, 0, np.zeros((h, w), dtype=np.uint8)
 
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     b_ch = bgr[..., 0].astype(np.float32)
@@ -291,10 +292,10 @@ def heal_universal_structural_defects(
         a_pin = cv2.GaussianBlur(pinhole_mask.astype(np.float32), (3, 3), 0.6)
         a_f = np.maximum(a_f, np.clip(a_pin, 0.0, 1.0))
 
-    # Stage 3: Trapped Green-Screen Crevice Punch-Out (only on green-screen scenes)
+    # Stage 2: Opt-in Trapped Green-Screen Crevice Punch-Out (only when requested on green-screen scenes)
     crevice_px = 0
     punch_mask = np.zeros((h, w), dtype=np.uint8)
-    if is_green_bg:
+    if clean_green_crevices and is_green_bg:
         from src.relight_harmonizer import detect_emissive_screen_mask
 
         ext_strong_green = ext_zone & (g_exc > 15.0) & (hsv[..., 0] >= 32) & (hsv[..., 0] <= 96) & (hsv[..., 1] >= 35)
@@ -367,8 +368,8 @@ def heal_universal_structural_defects(
                 punch_soft = cv2.GaussianBlur(punch_mask.astype(np.float32), (3, 3), 0.7)
                 a_f = a_f * (1.0 - np.clip(punch_soft * 1.15, 0.0, 1.0))
 
-    total_healed = bezel_px + pin_px + crevice_px
-    combined = ((bezel_mask > 0) | (pinhole_mask > 0) | (punch_mask > 0)).astype(np.uint8)
+    total_healed = pin_px + crevice_px
+    combined = ((pinhole_mask > 0) | (punch_mask > 0)).astype(np.uint8)
     return np.clip(a_f, 0.0, 1.0).astype(np.float32), total_healed, combined
 
 
@@ -494,9 +495,7 @@ def audit_and_heal_video_mattes(
 
                 # Excess leak: skip erasing confirmed keyframe choices; only trim peripheral blobs <= 40% of FG
                 if confirmed_frame_indices is None or int(t) not in confirmed_frame_indices:
-                    dev_core, skin, _, _ = _detect_device_core_and_priors(bgr, fg_bin)
-                    dev_protect = cv2.dilate(dev_core, cv2.getStructuringElement(cv2.MORPH_RECT, (37, 37))) > 0
-                    exc_cand = ((alpha_t >= 0.60) & (alpha_ref < 0.12) & (~dev_protect) & (~skin)).astype(np.uint8)
+                    exc_cand = ((alpha_t >= 0.60) & (alpha_ref < 0.12)).astype(np.uint8)
                     min_exc_area = max(280, int(h * w * 0.0007))
                     max_exc_area = max(min_exc_area + 200, int(fg_area_cur * 0.40))
                     ne, le, se, _ = cv2.connectedComponentsWithStats(exc_cand, connectivity=8)
@@ -518,7 +517,7 @@ def audit_and_heal_video_mattes(
                 healed_a = alpha_bezel.copy()
                 if np.any(missing_mask > 0):
                     miss_soft = cv2.GaussianBlur(missing_mask.astype(np.float32), (5, 5), 1.0)
-                    healed_a = np.maximum(healed_a, miss_soft)
+                    healed_a = np.maximum(healed_a, np.clip(alpha_ref * miss_soft, 0.0, 1.0))
                 if np.any(excess_mask > 0):
                     exc_soft = cv2.GaussianBlur(excess_mask.astype(np.float32), (5, 5), 1.0)
                     healed_a = np.clip(healed_a * (1.0 - exc_soft), 0.0, 1.0)

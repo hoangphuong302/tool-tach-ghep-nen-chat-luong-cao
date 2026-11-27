@@ -270,7 +270,12 @@ def test_universal_hole_guard_preserves_bg_gap_and_cleans_green_slit() -> None:
     alpha[135:185, 156:167] = 0.90
 
     assert is_green_screen_scene(bgr, alpha) is True
-    healed, _, _ = heal_universal_structural_defects(bgr, alpha)
+    # Default mode leaves exterior/slit geometry untouched (never eats shadowed skin/green subjects by surprise)
+    healed_default, _, _ = heal_universal_structural_defects(bgr, alpha)
+    assert float(np.mean(healed_default[184:191, 110:120])) > 0.70  # interior body pinhole healed
+    assert float(np.mean(healed_default[127:138, 110:122])) > 0.85  # green UI dot inside emissive screen preserved
+    # Explicit green-screen crevice mode punches out confirmed chroma-green cloth slit
+    healed, _, _ = heal_universal_structural_defects(bgr, alpha, clean_green_crevices=True)
     assert float(np.mean(healed[142:178, 158:165])) < 0.15  # trapped shadowed green crevice punched out
     assert float(np.mean(healed[184:191, 110:120])) > 0.70  # interior device body pinhole healed
     assert float(np.mean(healed[127:138, 110:122])) > 0.85  # green UI dot inside emissive screen preserved
@@ -335,7 +340,7 @@ def test_green_bounce_on_shadowed_skin_and_white_bezel_never_eaten() -> None:
     bgr[135:185, 159:170] = (42, 86, 44)
     alpha[135:185, 159:170] = 0.90
 
-    healed, _, _ = heal_universal_structural_defects(bgr, alpha)
+    healed, _, _ = heal_universal_structural_defects(bgr, alpha, clean_green_crevices=True)
     assert float(np.mean(healed[142:173, 176:194])) > 0.95  # shadowed skin preserved 100%
     assert float(np.mean(healed[60:120, 153:158])) > 0.95   # tinted white bezel preserved 100%
     assert float(np.mean(healed[142:178, 161:168])) < 0.15  # real green cloth crevice punched out
@@ -383,3 +388,88 @@ def test_auto_cut_hybrid_rejects_shadowed_green_triangle_and_keeps_real_part(mon
     assert float(np.mean(alpha_out[125:180, 68:87])) < 0.15
     assert float(np.mean(mask_out[125:180, 68:87])) < 0.15
     assert float(np.mean(alpha_out[60:180, 156:164])) > 0.70
+
+
+def test_tilted_device_over_shadowed_green_and_wood_never_adds_background_triangles(tmp_path: Path, monkeypatch) -> None:
+    """
+    Regression test for real-world tilted handheld device over shadowed green screen + wooden desk:
+    Pure AI matte must pass through `heal_universal_structural_defects`, `audit_and_heal_video_mattes`,
+    and `/auto-cut` (1-Click & Chroma AI) with ZERO convex-hull background triangles added.
+    """
+    from fastapi.testclient import TestClient
+
+    import studio_server
+
+    h, w = 320, 220
+    bgr = np.zeros((h, w, 3), dtype=np.uint8)
+    bgr[:195, :] = (55, 118, 48)    # shadowed dark teal-green screen cloth
+    bgr[195:, :] = (115, 168, 205)  # warm wooden desk in lower third
+
+    # Tilted rectangular device (dark glass + blue UI + white side rim) held by hand
+    pts_dev = np.array([[72, 48], [156, 62], [134, 228], [50, 214]], dtype=np.int32)
+    pts_ui = np.array([[80, 64], [146, 75], [130, 194], [64, 183]], dtype=np.int32)
+    cv2.fillConvexPoly(bgr, pts_dev, (24, 24, 28))
+    cv2.fillConvexPoly(bgr, pts_ui, (150, 52, 24))
+    cv2.line(bgr, (156, 62), (134, 228), (235, 238, 240), thickness=4)
+    # Hand fingers wrapping right & bottom (creating concave bays next to tilted chassis)
+    cv2.circle(bgr, (162, 165), 26, (125, 155, 205), -1)
+    cv2.ellipse(bgr, (120, 248), (64, 30), 12, 0, 360, (125, 155, 205), -1)
+
+    alpha_clean = np.zeros((h, w), dtype=np.float32)
+    cv2.fillConvexPoly(alpha_clean, pts_dev, 1.0)
+    cv2.circle(alpha_clean, (162, 165), 26, 1.0, -1)
+    cv2.ellipse(alpha_clean, (120, 248), (64, 30), 12, 0, 360, 1.0, -1)
+
+    # 1. heal_universal_structural_defects must add ZERO background pixels around tilted flanks/wood
+    healed, healed_px, _ = heal_universal_structural_defects(bgr, alpha_clean)
+    added_bg = int(np.sum((healed >= 0.5) & (alpha_clean < 0.5)))
+    removed_fg = int(np.sum((healed < 0.5) & (alpha_clean >= 0.5)))
+    assert healed_px == 0
+    assert added_bg == 0, f"Unexpectedly added {added_bg} background pixels!"
+    assert removed_fg == 0, f"Unexpectedly removed {removed_fg} foreground pixels!"
+
+    # 2. audit_and_heal_video_mattes must score 100% with 0 false heals when tracker matches BiRefNet
+    fdir = tmp_path / "f"
+    mdir = tmp_path / "m"
+    fdir.mkdir()
+    mdir.mkdir()
+    fpaths, mpaths = [], []
+    for t in range(6):
+        fp = fdir / f"{t:05d}.jpg"
+        mp = mdir / f"{t:05d}.png"
+        cv2.imwrite(str(fp), bgr)
+        cv2.imwrite(str(mp), (alpha_clean * 255).astype(np.uint8))
+        fpaths.append(fp)
+        mpaths.append(mp)
+    rep = audit_and_heal_video_mattes(
+        fpaths,
+        mpaths,
+        is_alpha_stream=True,
+        sample_ratio=0.5,
+        min_samples=3,
+        use_birefnet_crosscheck=False,
+        crosscheck_fn=lambda _: alpha_clean,
+    )
+    assert rep["flagged_frames"] == 0
+    assert rep["integrity_score"] == 100.0
+
+    # 3. Studio server 1-Click & Chroma AI endpoints return exact clean alpha without desk or triangle leaks
+    store = studio_server.SessionStore(base_dir=tmp_path / "sessions", ttl_seconds=600)
+    monkeypatch.setattr(studio_server, "STORE", store)
+    monkeypatch.setattr(studio_server, "run_birefnet_matting", lambda img, max_size=1024: alpha_clean.copy())
+
+    client = TestClient(studio_server.app)
+    sid = client.post("/matting/api/session").json()["session_id"]
+    _, enc = cv2.imencode(".png", bgr)
+    ui = client.post(f"/matting/api/session/{sid}/upload/init", json={"role": "source", "filename": "tilted.png", "total_size": len(enc)})
+    uid = ui.json()["upload_id"]
+    client.put(f"/matting/api/session/{sid}/upload/{uid}/chunk?index=0", content=enc.tobytes())
+    client.post(f"/matting/api/session/{sid}/upload/{uid}/complete")
+
+    for mode in ("birefnet", "chroma"):
+        res = client.post(f"/matting/api/session/{sid}/auto-cut", json={"frame_idx": 0, "mode": mode, "engine": "matanyone2"})
+        assert res.status_code == 200, res.text
+        sess = store.get(sid)
+        saved_alpha = sess.birefnet_alpha_by_frame[0]
+        assert int(np.sum((saved_alpha >= 0.5) & (alpha_clean < 0.5))) == 0
+        assert int(np.sum((saved_alpha < 0.5) & (alpha_clean >= 0.5))) == 0
