@@ -82,7 +82,7 @@ def estimate_foreground_pymatting(
             roi_rgb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB).astype(np.float64) / 255.0
             roi_a = alpha_f[y0:y1, x0:x1].astype(np.float64)
 
-            max_dim = 480 if fast_preview else 960
+            max_dim = 640 if fast_preview else 960
             n_small = 5 if fast_preview else 8
             n_big = 1
             if max(rh, rw) > max_dim:
@@ -107,18 +107,21 @@ def estimate_foreground_pymatting(
                 )
             est_bgr = np.clip(est_rgb[..., ::-1], 0.0, 1.0).astype(np.float32)
 
-            # Full ML foreground on fractional edges; smooth taper + 1px near-opaque rim (alpha >= 0.996 stays lossless)
+            # Physical compositing feasibility clamp: from I = a*F + (1-a)*B with B in [0, 1],
+            # true foreground F MUST lie in [(I - (1-a))/a, I/a]. This mathematically guarantees
+            # thin dark details next to bright bezels (e.g. black side buttons at alpha ~0.90)
+            # can NEVER be bleached white by coarse color diffusion, while translucent halo pixels
+            # still get full PyMatting background removal.
             roi_a_f = alpha_f[y0:y1, x0:x1]
-            edge_w = np.clip((0.996 - roi_a_f) / (0.996 - 0.985), 0.0, 1.0) * s
-            near_rim = (
-                (cv2.dilate((roi_a_f < 0.94).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))) > 0)
-                & (roi_a_f >= 0.985)
-                & (roi_a_f < 0.996)
-            )
-            edge_w[near_rim] = np.maximum(edge_w[near_rim], 0.35 * s)
+            orig_roi = fg_f[y0:y1, x0:x1]
+            a_safe = np.maximum(roi_a_f[..., None], 1e-3)
+            f_lo = np.clip((orig_roi - (1.0 - a_safe)) / a_safe, 0.0, 1.0)
+            f_hi = np.clip(orig_roi / a_safe, 0.0, 1.0)
+            est_bgr = np.clip(est_bgr, f_lo, f_hi)
+
+            edge_w = np.clip((0.996 - roi_a_f) / (0.996 - 0.975), 0.0, 1.0) * s
             edge_w[roi_a_f <= 0.002] = 0.0
             edge_w[roi_a_f >= 0.996] = 0.0
-            orig_roi = fg_f[y0:y1, x0:x1]
             fg_f[y0:y1, x0:x1] = orig_roi * (1.0 - edge_w[..., None]) + est_bgr * edge_w[..., None]
 
     if despill_green:

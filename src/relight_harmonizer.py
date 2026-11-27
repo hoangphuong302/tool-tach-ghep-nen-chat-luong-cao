@@ -22,6 +22,180 @@ class RelightConfig:
     linear_compositing: bool = False          # Composite & light-wrap in Linear RGB (eliminates dark sRGB fringes)
     edge_blur_match: float = 0.0              # Optional foreground edge softness match (0.0..2.0 px)
     black_point_match: float = 0.0            # Black-point & highlight roll-off match to background (0.0..1.0)
+    # Background grading & reverse source-matching (BG -> Source)
+    bg_match_source_strength: float = 0.0     # Match BG exposure/contrast/color-temp to source foreground (0.0..1.0)
+    bg_brightness: float = 0.0                # Manual BG brightness shift (-0.5..+0.5)
+    bg_contrast: float = 1.0                  # Manual BG contrast multiplier (0.5..1.6)
+    bg_saturation: float = 1.0                # Manual BG saturation multiplier (0.0..2.0)
+    bg_temperature: float = 0.0               # Manual BG color temperature cool(-1)..warm(+1)
+    bg_tint: float = 0.0                      # Manual BG green(-1)..magenta(+1) tint
+
+
+def transform_background_frame(
+    bg_bgr: np.ndarray,
+    target_w: int,
+    target_h: int,
+    *,
+    scale: float = 1.0,
+    offset_x: float = 0.0,
+    offset_y: float = 0.0,
+) -> np.ndarray:
+    """
+    Aspect-preserving cover fit + user zoom (`scale` in [0.5, 3.0]) and pan
+    (`offset_x`, `offset_y` as fractions of target frame size in [-0.5, +0.5]).
+    Uses sub-pixel cubic warping with smooth border reflection (never stretches or adds black bars).
+    """
+    bh, bw = bg_bgr.shape[:2]
+    tw, th = max(1, int(target_w)), max(1, int(target_h))
+    s_user = float(np.clip(scale, 0.5, 3.0))
+    ox_frac = float(np.clip(offset_x, -0.5, 0.5))
+    oy_frac = float(np.clip(offset_y, -0.5, 0.5))
+
+    cover_scale = max(tw / max(float(bw), 1.0), th / max(float(bh), 1.0))
+    eff_scale = cover_scale * s_user
+
+    # Fast exact path when default transform matches target aspect ratio
+    if (
+        abs(s_user - 1.0) < 1e-4
+        and abs(ox_frac) < 1e-4
+        and abs(oy_frac) < 1e-4
+        and abs((bw / max(float(bh), 1.0)) - (tw / max(float(th), 1.0))) < 1e-3
+    ):
+        if (bw, bh) == (tw, th):
+            return bg_bgr.copy()
+        return cv2.resize(bg_bgr, (tw, th), interpolation=cv2.INTER_CUBIC)
+
+    cx_src = bw * 0.5
+    cy_src = bh * 0.5
+    cx_dst = tw * 0.5 + ox_frac * tw
+    cy_dst = th * 0.5 + oy_frac * th
+
+    M = np.array(
+        [
+            [eff_scale, 0.0, cx_dst - eff_scale * cx_src],
+            [0.0, eff_scale, cy_dst - eff_scale * cy_src],
+        ],
+        dtype=np.float32,
+    )
+    interp = cv2.INTER_AREA if eff_scale < 0.95 else cv2.INTER_CUBIC
+    return cv2.warpAffine(
+        bg_bgr,
+        M,
+        (tw, th),
+        flags=interp,
+        borderMode=cv2.BORDER_REFLECT_101,
+    )
+
+
+def grade_and_match_background(
+    bg_bgr: np.ndarray,
+    fg_ref_bgr: Optional[np.ndarray],
+    fg_mask_u8: Optional[np.ndarray],
+    *,
+    screen_mask: Optional[np.ndarray] = None,
+    match_source_strength: float = 0.0,
+    brightness: float = 0.0,
+    contrast: float = 1.0,
+    saturation: float = 1.0,
+    temperature: float = 0.0,
+    tint: float = 0.0,
+) -> np.ndarray:
+    """
+    Fast background harmonization & color grading (~2–4ms at 1080p):
+      1. Reverse Light/Tone Match (BG -> Source): aligns background exposure, contrast spread,
+         and CIE Lab white-balance/warmth to the lighting falling on the source subject
+         (excluding self-luminous UI screens and exterior chroma background).
+      2. Manual Background Color Controls: brightness, contrast, saturation, temperature, tint.
+    """
+    ms = float(np.clip(match_source_strength, 0.0, 1.0))
+    br = float(np.clip(brightness, -0.5, 0.5))
+    ct = float(np.clip(contrast, 0.5, 1.6))
+    sat = float(np.clip(saturation, 0.0, 2.0))
+    temp = float(np.clip(temperature, -1.0, 1.0))
+    tnt = float(np.clip(tint, -1.0, 1.0))
+
+    if (
+        ms <= 1e-3
+        and abs(br) <= 1e-3
+        and abs(ct - 1.0) <= 1e-3
+        and abs(sat - 1.0) <= 1e-3
+        and abs(temp) <= 1e-3
+        and abs(tnt) <= 1e-3
+    ):
+        return bg_bgr
+
+    out_lab = cv2.cvtColor(bg_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+    # 1. Auto-Match Background Lighting & Tone to Source Foreground
+    if ms > 1e-3 and fg_ref_bgr is not None and fg_mask_u8 is not None and np.any(fg_mask_u8 > 0):
+        h, w = bg_bgr.shape[:2]
+        sample_mask = fg_mask_u8 > 0
+        if screen_mask is not None and screen_mask.shape == (h, w):
+            non_scr = sample_mask & (screen_mask == 0)
+            if int(np.sum(non_scr)) >= 100:
+                sample_mask = non_scr
+
+        if min(h, w) >= 320:
+            sw, sh = max(64, int(round(w * 0.25))), max(64, int(round(h * 0.25)))
+            fg_s_lab = cv2.cvtColor(cv2.resize(fg_ref_bgr, (sw, sh), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2LAB).astype(np.float32)
+            bg_s_lab = cv2.resize(out_lab, (sw, sh), interpolation=cv2.INTER_AREA)
+            m_s = cv2.resize(sample_mask.astype(np.uint8), (sw, sh), interpolation=cv2.INTER_NEAREST) > 0
+            fg_vals = fg_s_lab[m_s] if np.any(m_s) else fg_s_lab.reshape(-1, 3)
+            bg_vals = bg_s_lab.reshape(-1, 3)
+        else:
+            fg_vals = cv2.cvtColor(fg_ref_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)[sample_mask]
+            bg_vals = out_lab.reshape(-1, 3)
+
+        if len(fg_vals) >= 16 and len(bg_vals) >= 16:
+            # Estimate ambient scene light from source subject (avoid crushed blacks & specular peaks)
+            fg_l_med = float(np.median(fg_vals[:, 0]))
+            fg_l_iqr = float(np.percentile(fg_vals[:, 0], 80) - np.percentile(fg_vals[:, 0], 20)) / 1.68 + 1e-4
+            bg_l_med = float(np.median(bg_vals[:, 0]))
+            bg_l_iqr = float(np.percentile(bg_vals[:, 0], 80) - np.percentile(bg_vals[:, 0], 20)) / 1.68 + 1e-4
+
+            # Exposure & contrast alignment
+            tgt_l = bg_l_med + (fg_l_med - bg_l_med) * (0.68 * ms)
+            slope = float(np.clip(1.0 + (np.clip(fg_l_iqr / bg_l_iqr, 0.65, 1.55) - 1.0) * (0.55 * ms), 0.72, 1.38))
+            out_lab[..., 0] = np.clip(tgt_l + (out_lab[..., 0] - bg_l_med) * slope, 0.0, 255.0)
+
+            # Chromaticity (color temperature & tint) match referenced to source highlights/midtones
+            # Prefer near-neutral / brighter subject pixels (white bezels, paper, neutral fabric) when available
+            # so warm human skin alone doesn't over-orange the background.
+            chroma_mag = np.hypot(fg_vals[:, 1] - 128.0, fg_vals[:, 2] - 128.0)
+            neut = fg_vals[(fg_vals[:, 0] >= 70.0) & (chroma_mag <= 24.0)]
+            if len(neut) >= 24:
+                src_a = float(np.median(neut[:, 1]))
+                src_b = float(np.median(neut[:, 2]))
+            else:
+                # Dampen skin warmth gently so background matches ambient light rather than turning peach
+                src_a = 128.0 + (float(np.median(fg_vals[:, 1])) - 128.0) * 0.45
+                src_b = 128.0 + (float(np.median(fg_vals[:, 2])) - 128.0) * 0.55
+
+            bg_a = float(np.median(bg_vals[:, 1]))
+            bg_b = float(np.median(bg_vals[:, 2]))
+            da = float(np.clip(src_a - bg_a, -18.0, 18.0)) * (0.78 * ms)
+            db = float(np.clip(src_b - bg_b, -28.0, 28.0)) * (0.85 * ms)
+            out_lab[..., 1] = np.clip(out_lab[..., 1] + da, 0.0, 255.0)
+            out_lab[..., 2] = np.clip(out_lab[..., 2] + db, 0.0, 255.0)
+
+    # 2. Manual Background Color & Light Grading
+    if abs(br) > 1e-3 or abs(ct - 1.0) > 1e-3:
+        L = out_lab[..., 0]
+        L = (L - 128.0) * ct + 128.0 + br * 110.0
+        out_lab[..., 0] = np.clip(L, 0.0, 255.0)
+
+    if abs(sat - 1.0) > 1e-3:
+        out_lab[..., 1] = np.clip(128.0 + (out_lab[..., 1] - 128.0) * sat, 0.0, 255.0)
+        out_lab[..., 2] = np.clip(128.0 + (out_lab[..., 2] - 128.0) * sat, 0.0, 255.0)
+
+    if abs(temp) > 1e-3:
+        out_lab[..., 2] = np.clip(out_lab[..., 2] + temp * 28.0, 0.0, 255.0)
+        out_lab[..., 1] = np.clip(out_lab[..., 1] + temp * 4.0, 0.0, 255.0)
+
+    if abs(tnt) > 1e-3:
+        out_lab[..., 1] = np.clip(out_lab[..., 1] + tnt * 24.0, 0.0, 255.0)
+
+    return cv2.cvtColor(out_lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
 
 
 _SRGB_TO_LIN_LUT = np.power(np.linspace(0.0, 1.0, 4096, dtype=np.float32), 2.2).astype(np.float32)
@@ -672,6 +846,32 @@ def composite_with_relighting(
 
     if cfg.bg_defocus_sigma > 0.1:
         bg_bgr = cv2.GaussianBlur(bg_bgr, (0, 0), sigmaX=float(cfg.bg_defocus_sigma))
+
+    # Stage 0: Background Color Grading & Reverse Light/Tone Match (BG -> Source)
+    if (
+        float(getattr(cfg, "bg_match_source_strength", 0.0)) > 1e-3
+        or abs(float(getattr(cfg, "bg_brightness", 0.0))) > 1e-3
+        or abs(float(getattr(cfg, "bg_contrast", 1.0)) - 1.0) > 1e-3
+        or abs(float(getattr(cfg, "bg_saturation", 1.0)) - 1.0) > 1e-3
+        or abs(float(getattr(cfg, "bg_temperature", 0.0))) > 1e-3
+        or abs(float(getattr(cfg, "bg_tint", 0.0))) > 1e-3
+    ):
+        scr_for_bg = screen_mask
+        if scr_for_bg is None and cfg.protect_emissive_screen and float(getattr(cfg, "bg_match_source_strength", 0.0)) > 1e-3:
+            scr_for_bg = detect_emissive_screen_mask(fg_clean_bgr, fg_mask_u8)
+            screen_mask = scr_for_bg
+        bg_bgr = grade_and_match_background(
+            bg_bgr,
+            fg_clean_bgr,
+            fg_mask_u8,
+            screen_mask=scr_for_bg,
+            match_source_strength=float(getattr(cfg, "bg_match_source_strength", 0.0)),
+            brightness=float(getattr(cfg, "bg_brightness", 0.0)),
+            contrast=float(getattr(cfg, "bg_contrast", 1.0)),
+            saturation=float(getattr(cfg, "bg_saturation", 1.0)),
+            temperature=float(getattr(cfg, "bg_temperature", 0.0)),
+            tint=float(getattr(cfg, "bg_tint", 0.0)),
+        )
 
     # Stage 1: CIE Lab Ambient Color Temperature & Exposure Harmonization
     fg_harmonized_bgr = _transfer_ambient_lab(

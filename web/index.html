@@ -265,6 +265,7 @@
               </div>
             </div>
             <div class="tool-group ml-auto">
+              <button type="button" id="btnDragBgMode" class="btn btn-ghost btn-xs" title="Bật để nhấn kéo chuột di chuyển trực tiếp vị trí nền trên khung xem trước">✋ Kéo nền</button>
               <button type="button" class="btn btn-ghost btn-xs comp-zoom-preset" data-zoom="1" data-px="0.5" data-py="0.5">Fit</button>
               <button type="button" class="btn btn-ghost btn-xs comp-zoom-preset" data-zoom="2" data-px="0.5" data-py="0.5">2×</button>
               <button type="button" class="btn btn-ghost btn-xs comp-zoom-preset" data-zoom="3" data-px="0.5" data-py="0.5">3×</button>
@@ -315,9 +316,64 @@
           </div>
 
           <div class="inspector-tabs" role="tablist">
+            <button type="button" class="itab" data-itab="bg">🖼️ Nền</button>
             <button type="button" class="itab active" data-itab="light">🎨 Ánh sáng</button>
             <button type="button" class="itab" data-itab="edge">✂️ Viền &amp; AI</button>
-            <button type="button" class="itab" data-itab="export">🎬 Xuất Video</button>
+            <button type="button" class="itab" data-itab="export">🎬 Xuất</button>
+          </div>
+
+          <!-- TAB: BACKGROUND TRANSFORM, COLOR & SOURCE SYNC -->
+          <div class="itab-pane" data-pane="bg">
+            <div class="slider-list">
+              <label class="slider-row">
+                <div class="slider-head"><span>Phóng to / Thu nhỏ nền</span><span class="mono val" data-val-for="slBgScale">1.00×</span></div>
+                <input type="range" id="slBgScale" class="live-param" min="0.5" max="3.0" step="0.02" value="1.0" />
+              </label>
+              <label class="slider-row">
+                <div class="slider-head"><span>Vị trí nền Ngang (X)</span><span class="mono val" data-val-for="slBgOffsetX">0%</span></div>
+                <input type="range" id="slBgOffsetX" class="live-param" min="-0.5" max="0.5" step="0.01" value="0" />
+              </label>
+              <label class="slider-row">
+                <div class="slider-head"><span>Vị trí nền Dọc (Y)</span><span class="mono val" data-val-for="slBgOffsetY">0%</span></div>
+                <input type="range" id="slBgOffsetY" class="live-param" min="-0.5" max="0.5" step="0.01" value="0" />
+              </label>
+            </div>
+            <div class="bg-quick-actions">
+              <button type="button" id="btnDragBgInTab" class="btn btn-secondary btn-xs">✋ Kéo nền trên ảnh</button>
+              <button type="button" id="btnResetBg" class="btn btn-ghost btn-xs">↺ Đặt lại nền</button>
+            </div>
+
+            <div class="bg-section-label">Đồng bộ Nền theo Video Gốc</div>
+            <div class="slider-list" style="margin-top:6px">
+              <label class="slider-row">
+                <div class="slider-head"><span>✨ Khớp sáng &amp; tone nền theo video gốc</span><span class="mono val" data-val-for="slBgMatchSrc">0</span></div>
+                <input type="range" id="slBgMatchSrc" class="live-param" min="0" max="1" step="0.05" value="0" />
+              </label>
+            </div>
+
+            <div class="bg-section-label">Chỉnh màu sắc &amp; Ánh sáng Nền</div>
+            <div class="slider-list" style="margin-top:6px">
+              <label class="slider-row">
+                <div class="slider-head"><span>Độ sáng nền</span><span class="mono val" data-val-for="slBgBrightness">0</span></div>
+                <input type="range" id="slBgBrightness" class="live-param" min="-0.5" max="0.5" step="0.02" value="0" />
+              </label>
+              <label class="slider-row">
+                <div class="slider-head"><span>Tương phản nền</span><span class="mono val" data-val-for="slBgContrast">1.00</span></div>
+                <input type="range" id="slBgContrast" class="live-param" min="0.5" max="1.6" step="0.02" value="1.0" />
+              </label>
+              <label class="slider-row">
+                <div class="slider-head"><span>Độ bão hòa màu nền</span><span class="mono val" data-val-for="slBgSaturation">1.00</span></div>
+                <input type="range" id="slBgSaturation" class="live-param" min="0" max="2.0" step="0.04" value="1.0" />
+              </label>
+              <label class="slider-row">
+                <div class="slider-head"><span>Nhiệt độ màu (Lạnh ⟷ Ấm)</span><span class="mono val" data-val-for="slBgTemp">0</span></div>
+                <input type="range" id="slBgTemp" class="live-param" min="-1" max="1" step="0.04" value="0" />
+              </label>
+              <label class="slider-row">
+                <div class="slider-head"><span>Tông sắc (Xanh lá ⟷ Tím hồng)</span><span class="mono val" data-val-for="slBgTint">0</span></div>
+                <input type="range" id="slBgTint" class="live-param" min="-1" max="1" step="0.04" value="0" />
+              </label>
+            </div>
           </div>
 
           <!-- TAB: LIGHT -->

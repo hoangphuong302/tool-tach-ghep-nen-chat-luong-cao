@@ -51,6 +51,7 @@ from src.relight_harmonizer import (
     RelightConfig,
     composite_with_relighting,
     detect_emissive_screen_mask,
+    transform_background_frame,
 )
 from src.segmentation import (
     auto_cut_universal_hybrid,
@@ -351,6 +352,16 @@ class PreviewReq(BaseModel):
     clean_ai_ghost: bool = False
     linear_compositing: bool = True
     pass2_legacy: bool = False
+    # Background transform, color grading & reverse light/tone matching (BG -> Source)
+    bg_scale: float = 1.0
+    bg_offset_x: float = 0.0
+    bg_offset_y: float = 0.0
+    bg_match_source: float = 0.0
+    bg_brightness: float = 0.0
+    bg_contrast: float = 1.0
+    bg_saturation: float = 1.0
+    bg_temperature: float = 0.0
+    bg_tint: float = 0.0
 
 
 class RenderReq(PreviewReq):
@@ -399,11 +410,24 @@ def _save_confirmed_mask(sess: SessionState, f_idx: int, mask: np.ndarray, push_
     return out_p
 
 
-def _get_bg_frame_bgr(sess: SessionState, f_idx: int, src_bgr: np.ndarray) -> Tuple[np.ndarray, Tuple[object, ...]]:
+def _get_bg_frame_bgr(
+    sess: SessionState,
+    f_idx: int,
+    src_bgr: np.ndarray,
+    *,
+    bg_scale: float = 1.0,
+    bg_offset_x: float = 0.0,
+    bg_offset_y: float = 0.0,
+) -> Tuple[np.ndarray, Tuple[object, ...]]:
     h, w = src_bgr.shape[:2]
+    sc_r = round(float(np.clip(bg_scale, 0.5, 3.0)), 3)
+    ox_r = round(float(np.clip(bg_offset_x, -0.5, 0.5)), 3)
+    oy_r = round(float(np.clip(bg_offset_y, -0.5, 0.5)), 3)
     if not sess.bg_frames:
         bg_synth = cv2.GaussianBlur(src_bgr, (0, 0), 22.0)
-        return bg_synth, ("synth", h, w)
+        if abs(sc_r - 1.0) > 1e-3 or abs(ox_r) > 1e-3 or abs(oy_r) > 1e-3:
+            bg_synth = transform_background_frame(bg_synth, w, h, scale=sc_r, offset_x=ox_r, offset_y=oy_r)
+        return bg_synth, ("synth", h, w, sc_r, ox_r, oy_r)
 
     if len(sess.bg_frames) == 1:
         t_bg = 0
@@ -413,19 +437,19 @@ def _get_bg_frame_bgr(sess: SessionState, f_idx: int, src_bgr: np.ndarray) -> Tu
 
     bg_path = sess.bg_frames[t_bg]
     st = bg_path.stat()
-    key = (str(bg_path), st.st_size, st.st_mtime_ns, h, w)
+    key = (str(bg_path), st.st_size, st.st_mtime_ns, h, w, sc_r, ox_r, oy_r)
     cached = sess.bg_cache.get(key)
     if cached is not None:
         sess.bg_cache.move_to_end(key)
         return cached, key
 
     bg_raw = _load_bgr(bg_path)
-    bg_resized = cv2.resize(bg_raw, (w, h), interpolation=cv2.INTER_CUBIC)
-    sess.bg_cache[key] = bg_resized
+    bg_transformed = transform_background_frame(bg_raw, w, h, scale=sc_r, offset_x=ox_r, offset_y=oy_r)
+    sess.bg_cache[key] = bg_transformed
     sess.bg_cache.move_to_end(key)
     while len(sess.bg_cache) > 8:
         sess.bg_cache.popitem(last=False)
-    return bg_resized, key
+    return bg_transformed, key
 
 
 def _ensure_preview_frame_matte(
@@ -663,7 +687,14 @@ def _compute_preview_bundle(sess: SessionState, req: PreviewReq) -> Tuple[np.nda
         raise HTTPException(status_code=400, detail="Chưa tải video/ảnh gốc lên phiên.")
     f_idx = int(np.clip(req.frame_idx, 0, len(sess.src_frames) - 1))
     src_bgr = _load_bgr(sess.src_frames[f_idx])
-    bg_bgr, bg_sig = _get_bg_frame_bgr(sess, f_idx, src_bgr)
+    bg_bgr, bg_sig = _get_bg_frame_bgr(
+        sess,
+        f_idx,
+        src_bgr,
+        bg_scale=float(req.bg_scale),
+        bg_offset_x=float(req.bg_offset_x),
+        bg_offset_y=float(req.bg_offset_y),
+    )
     fg_clean, alpha, m_key, auto_tracked = _get_matte_and_fg(sess, f_idx, src_bgr, req)
 
     comp_key = (
@@ -682,6 +713,12 @@ def _compute_preview_bundle(sess: SessionState, req: PreviewReq) -> Tuple[np.nda
         bool(req.linear_compositing),
         round(float(req.edge_blur_match), 2),
         bool(req.pass2_legacy),
+        round(float(req.bg_match_source), 3),
+        round(float(req.bg_brightness), 3),
+        round(float(req.bg_contrast), 3),
+        round(float(req.bg_saturation), 3),
+        round(float(req.bg_temperature), 3),
+        round(float(req.bg_tint), 3),
     )
     cached = sess.comp_cache.get(comp_key)
     if cached is not None:
@@ -704,6 +741,12 @@ def _compute_preview_bundle(sess: SessionState, req: PreviewReq) -> Tuple[np.nda
         linear_compositing=bool(req.linear_compositing),
         edge_blur_match=float(req.edge_blur_match),
         black_point_match=float(req.black_point_match),
+        bg_match_source_strength=float(req.bg_match_source),
+        bg_brightness=float(req.bg_brightness),
+        bg_contrast=float(req.bg_contrast),
+        bg_saturation=float(req.bg_saturation),
+        bg_temperature=float(req.bg_temperature),
+        bg_tint=float(req.bg_tint),
     )
     scr_mask = (
         detect_emissive_screen_mask(fg_clean, (alpha > 0.15).astype(np.uint8))
@@ -890,6 +933,12 @@ def _run_render_job(sess: SessionState, job_id: str, req: RenderReq) -> None:
             linear_compositing=bool(req.linear_compositing),
             edge_blur_match=float(req.edge_blur_match),
             black_point_match=float(req.black_point_match),
+            bg_match_source_strength=float(req.bg_match_source),
+            bg_brightness=float(req.bg_brightness),
+            bg_contrast=float(req.bg_contrast),
+            bg_saturation=float(req.bg_saturation),
+            bg_temperature=float(req.bg_temperature),
+            bg_tint=float(req.bg_tint),
         )
 
         job.update(progress=0.52, message="Đang bóc màu viền, ghép ánh sáng & nén GPU H.264...")
@@ -924,15 +973,29 @@ def _run_render_job(sess: SessionState, job_id: str, req: RenderReq) -> None:
 
             if not bg_frames:
                 bg_bgr = cv2.GaussianBlur(src_bgr, (0, 0), 22.0)
+                if abs(float(req.bg_scale) - 1.0) > 1e-3 or abs(float(req.bg_offset_x)) > 1e-3 or abs(float(req.bg_offset_y)) > 1e-3:
+                    bg_bgr = transform_background_frame(
+                        bg_bgr,
+                        w,
+                        h,
+                        scale=float(req.bg_scale),
+                        offset_x=float(req.bg_offset_x),
+                        offset_y=float(req.bg_offset_y),
+                    )
             else:
                 if len(bg_frames) == 1:
                     t_bg = 0
                 else:
                     mapped = int(round(t * (bg_fps / max(src_fps, 1.0))))
                     t_bg = mapped % len(bg_frames)
-                bg_bgr = _load_bgr(bg_frames[t_bg])
-                if (bg_bgr.shape[1], bg_bgr.shape[0]) != (w, h):
-                    bg_bgr = cv2.resize(bg_bgr, (w, h), interpolation=cv2.INTER_CUBIC)
+                bg_bgr = transform_background_frame(
+                    _load_bgr(bg_frames[t_bg]),
+                    w,
+                    h,
+                    scale=float(req.bg_scale),
+                    offset_x=float(req.bg_offset_x),
+                    offset_y=float(req.bg_offset_y),
+                )
                 if cam_transforms is not None and t < len(cam_transforms):
                     bg_bgr = warp_bg_with_camera_motion(bg_bgr, cam_transforms[t], (w, h))
                 elif v2v_transforms is not None and t < len(v2v_transforms):

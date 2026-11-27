@@ -33,6 +33,9 @@
     wipeRatio: 0.5,
     isDraggingWipe: false,
     isPanningComp: false,
+    dragBgMode: false,
+    isDraggingBg: false,
+    bgDragStart: { x: 0, y: 0, ox: 0, oy: 0 },
     compPanStart: { x: 0, y: 0, px: 0, py: 0 },
     compLeftImg: null,
     compRightImg: null,
@@ -684,6 +687,15 @@
       clean_ai_ghost: $('chkCleanGhost').checked,
       linear_compositing: $('chkLinearComp').checked,
       pass2_legacy: $('chkPass2Legacy').checked,
+      bg_scale: Number($('slBgScale')?.value ?? 1.0),
+      bg_offset_x: Number($('slBgOffsetX')?.value ?? 0.0),
+      bg_offset_y: Number($('slBgOffsetY')?.value ?? 0.0),
+      bg_match_source: Number($('slBgMatchSrc')?.value ?? 0.0),
+      bg_brightness: Number($('slBgBrightness')?.value ?? 0.0),
+      bg_contrast: Number($('slBgContrast')?.value ?? 1.0),
+      bg_saturation: Number($('slBgSaturation')?.value ?? 1.0),
+      bg_temperature: Number($('slBgTemp')?.value ?? 0.0),
+      bg_tint: Number($('slBgTint')?.value ?? 0.0),
       ...extra,
     };
   }
@@ -802,7 +814,8 @@
     const badge = $('compZoomBadge');
     if (badge) {
       const autoPrefix = state.lastAutoTracked ? `⚡ Tự bắt khung ${state.compFrame} · ` : '';
-      badge.textContent = `${autoPrefix}${state.compZoom.toFixed(2)}× · ${state.lastElapsedMs}ms · Kéo vạch chia | Lăn chuột Zoom`;
+      const modeHint = state.dragBgMode ? '✋ Đang kéo vị trí nền | Lăn chuột Zoom' : 'Kéo vạch chia | Lăn chuột Zoom';
+      badge.textContent = `${autoPrefix}${state.compZoom.toFixed(2)}× · ${state.lastElapsedMs}ms · ${modeHint}`;
     }
   }
 
@@ -850,11 +863,47 @@
       drawCompCanvas();
     }, { passive: false });
 
+    function formatParamLabel(el) {
+      const v = Number(el.value);
+      if (el.id === 'slBgScale') return `${v.toFixed(2)}×`;
+      if (el.id === 'slBgOffsetX' || el.id === 'slBgOffsetY') {
+        const pct = Math.round(v * 100);
+        return `${pct > 0 ? '+' : ''}${pct}%`;
+      }
+      return el.value;
+    }
+
+    function syncParamDisplay(id) {
+      const el = $(id);
+      const sp = document.querySelector(`[data-val-for="${id}"]`);
+      if (el && sp) sp.textContent = formatParamLabel(el);
+    }
+
+    function setDragBgMode(on) {
+      state.dragBgMode = Boolean(on);
+      ['btnDragBgMode', 'btnDragBgInTab'].forEach((id) => {
+        const b = $(id);
+        if (b) b.classList.toggle('active-toggle', state.dragBgMode);
+      });
+      const c = $('compCanvas');
+      if (c) c.style.cursor = state.dragBgMode ? 'grab' : '';
+      drawCompCanvas();
+    }
+
     canvas.addEventListener('pointerdown', (e) => {
       if (!state.compLeftImg) return;
       if (e.button === 1 || state.spaceDown || e.shiftKey) {
         state.isPanningComp = true;
         state.compPanStart = { x: e.clientX, y: e.clientY, px: state.compPanX, py: state.compPanY };
+      } else if (state.dragBgMode) {
+        state.isDraggingBg = true;
+        state.bgDragStart = {
+          x: e.clientX,
+          y: e.clientY,
+          ox: Number($('slBgOffsetX')?.value ?? 0),
+          oy: Number($('slBgOffsetY')?.value ?? 0),
+        };
+        canvas.style.cursor = 'grabbing';
       } else {
         state.isDraggingWipe = true;
         const rect = canvas.getBoundingClientRect();
@@ -869,6 +918,17 @@
         state.compPanX = state.compPanStart.px + (e.clientX - state.compPanStart.x);
         state.compPanY = state.compPanStart.py + (e.clientY - state.compPanStart.y);
         drawCompCanvas();
+      } else if (state.isDraggingBg) {
+        const iw = state.compLeftImg ? state.compLeftImg.width : 1080;
+        const ih = state.compLeftImg ? state.compLeftImg.height : 1920;
+        const tr = getFitTransform(canvas, iw, ih, state.compZoom, state.compPanX, state.compPanY);
+        const dxFrac = (e.clientX - state.bgDragStart.x) / Math.max(80, tr.drawW);
+        const dyFrac = (e.clientY - state.bgDragStart.y) / Math.max(80, tr.drawH);
+        const nx = Math.max(-0.5, Math.min(0.5, Math.round((state.bgDragStart.ox + dxFrac) * 100) / 100));
+        const ny = Math.max(-0.5, Math.min(0.5, Math.round((state.bgDragStart.oy + dyFrac) * 100) / 100));
+        if ($('slBgOffsetX')) { $('slBgOffsetX').value = String(nx); syncParamDisplay('slBgOffsetX'); }
+        if ($('slBgOffsetY')) { $('slBgOffsetY').value = String(ny); syncParamDisplay('slBgOffsetY'); }
+        schedulePreview(false, 90);
       } else if (state.isDraggingWipe) {
         const rect = canvas.getBoundingClientRect();
         state.wipeRatio = Math.max(0.02, Math.min(0.98, (e.clientX - rect.left) / Math.max(1, rect.width)));
@@ -876,7 +936,16 @@
       }
     });
 
-    const stopComp = () => { state.isDraggingWipe = false; state.isPanningComp = false; };
+    const stopComp = () => {
+      const wasDraggingBg = state.isDraggingBg;
+      state.isDraggingWipe = false;
+      state.isPanningComp = false;
+      state.isDraggingBg = false;
+      if (wasDraggingBg) {
+        canvas.style.cursor = state.dragBgMode ? 'grab' : '';
+        schedulePreview(true);
+      }
+    };
     canvas.addEventListener('pointerup', stopComp);
     canvas.addEventListener('pointercancel', stopComp);
     canvas.addEventListener('dblclick', () => {
@@ -886,6 +955,9 @@
       state.wipeRatio = 0.5;
       drawCompCanvas();
     });
+
+    state._setDragBgMode = setDragBgMode;
+    state._formatParamLabel = formatParamLabel;
   }
 
   // ------------------------------------------------------------------
@@ -1209,20 +1281,46 @@
     });
 
     $('btnRefreshPreview').addEventListener('click', () => schedulePreview(true));
+    $('btnDragBgMode')?.addEventListener('click', () => state._setDragBgMode && state._setDragBgMode(!state.dragBgMode));
+    $('btnDragBgInTab')?.addEventListener('click', () => state._setDragBgMode && state._setDragBgMode(!state.dragBgMode));
+    $('btnResetBg')?.addEventListener('click', () => {
+      const defaults = {
+        slBgScale: '1.0',
+        slBgOffsetX: '0',
+        slBgOffsetY: '0',
+        slBgMatchSrc: '0',
+        slBgBrightness: '0',
+        slBgContrast: '1.0',
+        slBgSaturation: '1.0',
+        slBgTemp: '0',
+        slBgTint: '0',
+      };
+      Object.entries(defaults).forEach(([id, val]) => {
+        const el = $(id);
+        if (!el) return;
+        el.value = val;
+        const sp = document.querySelector(`[data-val-for="${id}"]`);
+        if (sp) sp.textContent = state._formatParamLabel ? state._formatParamLabel(el) : val;
+      });
+      schedulePreview(true);
+      showToast('Đã đặt lại kích thước, vị trí và màu sắc nền về mặc định.', 'ok', 2200);
+    });
 
+    const HEAVY_EDGE_IDS = new Set(['slEdgePreserve', 'slDecont', 'slTrimap', 'slGuided', 'slErode', 'slEdgeBlur']);
     document.querySelectorAll('.live-param').forEach((el) => {
       const valSpan = document.querySelector(`[data-val-for="${el.id}"]`);
       const syncVal = () => {
-        if (valSpan) valSpan.textContent = el.value;
+        if (valSpan) valSpan.textContent = state._formatParamLabel ? state._formatParamLabel(el) : el.value;
       };
       syncVal();
       el.addEventListener('input', () => {
         syncVal();
-        schedulePreview(false);
+        schedulePreview(false, HEAVY_EDGE_IDS.has(el.id) ? 120 : 60);
       });
-      if (el.type === 'checkbox') {
-        el.addEventListener('change', () => schedulePreview(true));
-      }
+      el.addEventListener('change', () => {
+        syncVal();
+        schedulePreview(true);
+      });
     });
 
     $('btnRenderFinal').addEventListener('click', startFinalRender);

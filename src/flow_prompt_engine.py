@@ -480,20 +480,39 @@ def analyze_video_optical_profile(
     if not loaded_frames:
         raise ValueError("Không thể đọc khung hình hợp lệ để phân tích.")
 
+    # Propagate nearest known user mask to unsampled/unconfirmed sample frames so
+    # size, tilt, and shot-distance measurements stay consistent when only Frame 0 is cut.
+    known_pairs = [(i, m) for i, m in enumerate(loaded_masks) if m is not None and np.any(m > 0)]
+    if known_pairs:
+        for i in range(len(loaded_masks)):
+            if loaded_masks[i] is None or not np.any(loaded_masks[i] > 0):
+                _, nearest_m = min(known_pairs, key=lambda pair: abs(pair[0] - i))
+                loaded_masks[i] = nearest_m
+
     base = analyze_scene_telemetry(loaded_frames[0], fg_mask=loaded_masks[0])
     hand_w_list: List[float] = []
     hand_h_list: List[float] = []
     fg_occ_list: List[float] = []
+    orient_deg_list: List[float] = []
     gx_list: List[float] = []
     gy_list: List[float] = []
     contrast_list: List[float] = []
     luma_list: List[float] = []
+    black_p5_list: List[float] = []
+    white_p95_list: List[float] = []
+    sat_med_list: List[float] = []
     kelvin_list: List[float] = []
+    tint_a_list: List[float] = []
+    fg_sharp_list: List[float] = []
     bg_blur_list: List[float] = []
     grain_list: List[float] = []
+    chroma_noise_list: List[float] = []
     entry_scores = {"left": 0.0, "right": 0.0, "center": 0.0}
     has_meaningful_skin = False
     fg_spans_portrait = False
+    green_bg_votes = 0
+
+    from src.relight_harmonizer import detect_emissive_screen_mask
 
     for bgr, fmask in zip(loaded_frames, loaded_masks):
         x0, y0, x1, y1 = detect_active_frame_box(bgr)
@@ -506,13 +525,31 @@ def analyze_video_optical_profile(
             fg_act[int(ah * 0.20):int(ah * 0.96), int(aw * 0.14):int(aw * 0.86)] = 1
 
         fg_bool = fg_act > 0
-        skin = _extract_skin_roi_mask(act, fg_act)
+        bg_bool = ~fg_bool
+        if int(np.sum(bg_bool)) < 150:
+            bg_bool = np.ones((ah, aw), dtype=bool)
+
+        # Detect green-screen backdrop on exterior pixels so chroma cloth never skews Kelvin/noise/blur
+        b_bg = act[..., 0][bg_bool].astype(np.float32)
+        g_bg = act[..., 1][bg_bool].astype(np.float32)
+        r_bg = act[..., 2][bg_bool].astype(np.float32)
+        is_gs_frame = float(np.mean((g_bg - np.maximum(r_bg, b_bg)) > 16.0)) >= 0.22
+        if is_gs_frame:
+            green_bg_votes += 1
+
+        # Exclude glowing UI screens when measuring scene illumination, color tone, sharpness & sensor noise
+        scr_act = detect_emissive_screen_mask(act, fg_act) > 0
+        fg_non_scr = fg_bool & (~scr_act)
+        if int(np.sum(fg_non_scr)) < 120:
+            fg_non_scr = fg_bool
+
+        skin = _extract_skin_roi_mask(act, fg_act) & (~scr_act)
         skin_frac_frame = float(np.mean(skin)) if np.any(skin) else 0.0
         fg_frac_frame = max(1e-4, float(np.mean(fg_bool)))
         use_skin_roi = (skin_frac_frame >= 0.02) and (skin_frac_frame / fg_frac_frame >= 0.15)
         if use_skin_roi:
             has_meaningful_skin = True
-        measure_roi = skin if use_skin_roi else fg_bool
+        measure_roi = skin if use_skin_roi else fg_non_scr
 
         fg_occ_list.append(float(np.mean(fg_bool)) * 100.0)
         fy, fx = np.where(fg_bool)
@@ -520,8 +557,23 @@ def analyze_video_optical_profile(
             hand_w_list.append(float(np.max(fx) - np.min(fx) + 1) / float(max(aw, 1)) * 100.0)
             f_h_ratio = float(np.max(fy) - np.min(fy) + 1) / float(max(ah, 1))
             hand_h_list.append(f_h_ratio * 100.0)
-            if f_h_ratio >= 0.62 and float(np.min(fy)) <= float(ah) * 0.30:
+            if f_h_ratio >= 0.72 and float(np.min(fy)) <= float(ah) * 0.24 and not use_skin_roi:
                 fg_spans_portrait = True
+            elif f_h_ratio >= 0.80 and float(np.min(fy)) <= float(ah) * 0.18:
+                fg_spans_portrait = True
+            # Principal axis tilt angle of foreground subject (deg from vertical; + tilts right, - tilts left)
+            if len(fx) >= 60:
+                step_p = max(1, len(fx) // 1500)
+                pts = np.stack([fx[::step_p].astype(np.float32), fy[::step_p].astype(np.float32)], axis=1)
+                pts_c = pts - np.mean(pts, axis=0, keepdims=True)
+                cov = np.cov(pts_c.T)
+                eigvals, eigvecs = np.linalg.eigh(cov)
+                major = eigvecs[:, int(np.argmax(eigvals))]
+                # Ensure vector points upward (-y) so tilt left/right sign is intuitive
+                if major[1] > 0:
+                    major = -major
+                tilt_deg = float(np.degrees(np.arctan2(major[0], -major[1])))
+                orient_deg_list.append(tilt_deg)
             bot = measure_roi[int(ah * 0.70):ah, :]
             if np.any(bot):
                 bw = bot.shape[1]
@@ -530,6 +582,9 @@ def analyze_video_optical_profile(
                 entry_scores["right"] += float(np.mean(bot[:, (2 * bw) // 3:]))
 
         gray = cv2.cvtColor(act, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        lab_act = cv2.cvtColor(act, cv2.COLOR_BGR2LAB).astype(np.float32)
+        hsv_act = cv2.cvtColor(act, cv2.COLOR_BGR2HSV).astype(np.float32)
+
         y_m, x_m = np.where(measure_roi)
         if len(x_m) > 40:
             vals = gray[y_m, x_m]
@@ -540,31 +595,76 @@ def analyze_video_optical_profile(
             dv = vals - float(np.mean(vals))
             gx_list.append(float(np.mean(dx * dv)))
             gy_list.append(float(np.mean(dy * dv)))
-            p15, p50, p90 = np.percentile(vals, [15, 50, 90])
+            p5, p15, p50, p90, p95 = np.percentile(vals, [5, 15, 50, 90, 95])
             contrast_list.append(float(p90 - p15) / max(float(p50), 12.0))
             luma_list.append(float(np.mean(vals)))
+            black_p5_list.append(float(p5))
+            white_p95_list.append(float(p95))
         else:
             contrast_list.append(0.45)
             luma_list.append(float(np.mean(gray)))
+            black_p5_list.append(float(np.percentile(gray, 5)))
+            white_p95_list.append(float(np.percentile(gray, 95)))
 
-        bg_bool = ~fg_bool
-        if int(np.sum(bg_bool)) < 150:
-            bg_bool = np.ones((ah, aw), dtype=bool)
-        b_m = float(np.mean(act[..., 0][bg_bool]))
-        r_m = float(np.mean(act[..., 2][bg_bool]))
-        rb_diff = r_m - b_m
-        kelvin_list.append(float(np.clip(5400.0 - rb_diff * 24.0, 3200.0, 6800.0)))
+        # Color tone, saturation & Kelvin estimated from real subject lighting (never corrupted by green screen!)
+        fg_lab_vals = lab_act[fg_non_scr]
+        fg_hsv_s = hsv_act[..., 1][fg_non_scr]
+        sat_med_list.append(float(np.median(fg_hsv_s)) / 255.0 if len(fg_hsv_s) else 0.35)
 
+        if is_gs_frame:
+            # Prefer neutral bright/midtone pixels on foreground (white bezels, paper, neutral clothing)
+            # to read true studio lamp Kelvin & green-magenta tint without skin or green-screen bias.
+            chroma_mag = np.hypot(fg_lab_vals[:, 1] - 128.0, fg_lab_vals[:, 2] - 128.0)
+            neut_px = fg_lab_vals[(fg_lab_vals[:, 0] >= 75.0) & (chroma_mag <= 24.0)]
+            if len(neut_px) >= 32:
+                b_shift = float(np.median(neut_px[:, 2]) - 128.0)
+                a_shift = float(np.median(neut_px[:, 1]) - 128.0)
+                kelvin_list.append(float(np.clip(5400.0 - b_shift * 95.0, 3200.0, 6800.0)))
+                tint_a_list.append(a_shift)
+            else:
+                # Reference skin baseline (~Lab a=142, b=144 under neutral 5300K light)
+                skin_vals = lab_act[measure_roi]
+                b_rel = float(np.median(skin_vals[:, 2]) - 144.0)
+                a_rel = float(np.median(skin_vals[:, 1]) - 142.0)
+                kelvin_list.append(float(np.clip(5300.0 - b_rel * 75.0, 3400.0, 6600.0)))
+                tint_a_list.append(a_rel * 0.5)
+        else:
+            b_m = float(np.mean(act[..., 0][bg_bool]))
+            r_m = float(np.mean(act[..., 2][bg_bool]))
+            rb_diff = r_m - b_m
+            kelvin_list.append(float(np.clip(5400.0 - rb_diff * 24.0, 3200.0, 6800.0)))
+            tint_a_list.append(float(np.median(lab_act[..., 1][bg_bool]) - 128.0))
+
+        # True Subject Optical Sharpness & Background DoF Blur
         lap = np.abs(cv2.Laplacian(gray, cv2.CV_32F, ksize=3))
-        fg_s = float(np.percentile(lap[fg_bool], 90)) if np.any(fg_bool) else 25.0
-        bg_s = float(np.percentile(lap[bg_bool], 90))
-        ratio = fg_s / max(bg_s, 1.0)
-        bg_blur_list.append(float(np.clip(0.4 + max(0.0, ratio - 1.1) * 0.75, 0.4, 3.8)))
+        fg_s = float(np.percentile(lap[fg_non_scr], 90)) if np.any(fg_non_scr) else 25.0
+        fg_sharp_list.append(fg_s)
+        if is_gs_frame:
+            # Physically calibrated DoF softness from subject distance rather than flat green cloth
+            est_blur = 2.0 if base["subject_distance_cm"] <= 36 else (1.4 if base["subject_distance_cm"] <= 50 else 1.0)
+            bg_blur_list.append(est_blur)
+        else:
+            bg_s = float(np.percentile(lap[bg_bool], 90))
+            ratio = fg_s / max(bg_s, 1.0)
+            bg_blur_list.append(float(np.clip(0.4 + max(0.0, ratio - 1.1) * 0.75, 0.4, 3.8)))
 
-        blur_ref = cv2.GaussianBlur(gray, (5, 5), 1.0)
-        hp = np.abs(gray[bg_bool] - blur_ref[bg_bool])
+        # Sensor Luma & Chroma Noise measured on smooth interior patches of the FOREGROUND subject
+        # (never misreading flat compressed green-screen cloth as camera noise!)
+        smooth_roi = fg_non_scr & (lap <= float(np.percentile(lap[fg_non_scr], 60))) if np.any(fg_non_scr) else fg_bool
+        if int(np.sum(smooth_roi)) < 80:
+            smooth_roi = fg_non_scr
+        blur_ref = cv2.GaussianBlur(gray, (3, 3), 0.8)
+        hp = np.abs(gray[smooth_roi] - blur_ref[smooth_roi])
         mad_sigma = float(np.median(hp)) * 1.4826 / 255.0
         grain_list.append(mad_sigma)
+
+        a_ch = lab_act[..., 1]
+        b_ch_l = lab_act[..., 2]
+        c_hp = 0.5 * (
+            np.abs(a_ch[smooth_roi] - cv2.GaussianBlur(a_ch, (3, 3), 0.8)[smooth_roi])
+            + np.abs(b_ch_l[smooth_roi] - cv2.GaussianBlur(b_ch_l, (3, 3), 0.8)[smooth_roi])
+        )
+        chroma_noise_list.append(float(np.median(c_hp)) * 1.4826 / 255.0)
 
     # Multi-frame background camera motion
     motion_vals: List[float] = []
@@ -662,6 +762,84 @@ def analyze_video_optical_profile(
     bg_blur_sigma = round(float(np.mean(bg_blur_list)), 2)
     aperture_est = "f/1.8" if bg_blur_sigma >= 2.2 else ("f/2.2" if bg_blur_sigma >= 1.1 else "f/2.8")
     grain_sigma = round(float(np.mean(grain_list)), 4)
+    chroma_noise = round(float(np.mean(chroma_noise_list)), 4) if chroma_noise_list else 0.002
+    fg_sharp_val = round(float(np.mean(fg_sharp_list)), 1) if fg_sharp_list else 20.0
+    orient_deg = round(float(np.mean(orient_deg_list)), 1) if orient_deg_list else 0.0
+    black_p5 = round(float(np.mean(black_p5_list)), 1) if black_p5_list else 18.0
+    white_p95 = round(float(np.mean(white_p95_list)), 1) if white_p95_list else 210.0
+    sat_med = round(float(np.mean(sat_med_list)), 2) if sat_med_list else 0.35
+    tint_a = round(float(np.mean(tint_a_list)), 1) if tint_a_list else 0.0
+    is_green_screen_multi = green_bg_votes >= max(1, (len(loaded_frames) + 1) // 2)
+
+    # Subject orientation / tilt description
+    if orient_deg >= 6.0:
+        orient_vi = f"nghiêng ~{abs(orient_deg):.0f}° sang PHẢI"
+        orient_en = f"tilted ~{abs(orient_deg):.0f} degrees to the right"
+    elif orient_deg <= -6.0:
+        orient_vi = f"nghiêng ~{abs(orient_deg):.0f}° sang TRÁI"
+        orient_en = f"tilted ~{abs(orient_deg):.0f} degrees to the left"
+    else:
+        orient_vi = "thẳng đứng cân đối (~0°)"
+        orient_en = "upright vertical orientation (~0° tilt)"
+
+    # Optical Sharpness / Blur profile of the source footage
+    if fg_sharp_val >= 34.0:
+        sharp_vi = f"Nét cao sắc sảo (Laplacian {fg_sharp_val:.0f})"
+        sharp_en = "crisp natural 1080p smartphone optical sharpness on in-focus planes without artificial over-sharpening"
+    elif fg_sharp_val >= 14.0:
+        sharp_vi = f"Nét tự nhiên kiểu điện thoại (Laplacian {fg_sharp_val:.0f})"
+        sharp_en = "authentic everyday smartphone optical softness (organic micro-contrast, slightly soft lens resolution — never overly sharp CGI)"
+    else:
+        sharp_vi = f"Nét mềm nhẹ / hơi mờ chuyển động (Laplacian {fg_sharp_val:.0f})"
+        sharp_en = "soft organic handheld lens rendering with gentle motion softness and smooth roll-off (strictly avoid hyper-crisp AI textures)"
+
+    # Sensor Noise / Grain / Equivalent ISO classification
+    if grain_sigma >= 0.015:
+        iso_est = 1200
+        noise_vi = f"Nhiễu hạt rõ (ISO ~{iso_est}, grain {grain_sigma:.3f}, chroma {chroma_noise:.3f})"
+        noise_en = f"visible organic mobile low-light sensor noise (equivalent ~ISO {iso_est}, subtle luma + fine chroma grain matching real handheld compression)"
+    elif grain_sigma >= 0.007:
+        iso_est = 400
+        noise_vi = f"Nhiễu hạt cảm biến nhẹ tự nhiên (ISO ~{iso_est}, grain {grain_sigma:.3f})"
+        noise_en = f"subtle authentic consumer smartphone sensor grain (equivalent ~ISO {iso_est}, fine organic filmic luminance noise, no sterile AI plastic smoothness)"
+    else:
+        iso_est = 160
+        noise_vi = f"Rất sạch, hạt cảm biến siêu mịn (ISO ~{iso_est}, grain {grain_sigma:.3f})"
+        noise_en = f"clean daylight smartphone sensor texture (equivalent ~ISO {iso_est}, ultra-fine natural micro-grain, realistic mobile H.264 video texture)"
+
+    # Color Tone, Saturation & Black-Point Grading profile
+    if kelvin_est <= 4400:
+        tone_temp_vi = "Tông ấm (vàng dịu)"
+        tone_temp_en = f"warm indoor ~{kelvin_est}K color balance"
+    elif kelvin_est >= 5800:
+        tone_temp_vi = "Tông lạnh / trắng hiện đại"
+        tone_temp_en = f"clean cool-neutral ~{kelvin_est}K daylight/LED color balance"
+    else:
+        tone_temp_vi = "Tông trung tính tự nhiên"
+        tone_temp_en = f"neutral true-to-life ~{kelvin_est}K daylight color balance"
+
+    if sat_med <= 0.24:
+        sat_vi = "bão hòa màu dịu nhẹ"
+        sat_en = "muted natural low-to-moderate color saturation"
+    elif sat_med >= 0.48:
+        sat_vi = "màu sắc tươi rõ"
+        sat_en = "moderately rich, natural smartphone color saturation (non-oversaturated)"
+    else:
+        sat_vi = "bão hòa cân bằng trung thực"
+        sat_en = "balanced true-to-life consumer smartphone color saturation (no HDR oversaturation)"
+
+    if black_p5 >= 28.0:
+        bp_vi = f"vùng tối nâng nhẹ kiểu matte (P5={int(black_p5)})"
+        bp_en = "slightly lifted matte shadow floor with gentle contrast roll-off (avoid crushed pitch blacks)"
+    elif black_p5 <= 14.0:
+        bp_vi = f"vùng tối sâu rõ (P5={int(black_p5)}, P95={int(white_p95)})"
+        bp_en = "rich natural black-point depth and realistic dynamic range without harsh HDR clipping"
+    else:
+        bp_vi = f"tương phản & điểm đen cân bằng (P5={int(black_p5)}, P95={int(white_p95)})"
+        bp_en = "balanced smartphone contrast curve with natural shadow floor and soft highlight roll-off"
+
+    color_tone_vi = f"{tone_temp_vi}, {sat_vi}, {bp_vi}" + (" (đã tách bỏ sai lệch từ phông xanh)" if is_green_screen_multi else "")
+    color_tone_en = f"{tone_temp_en}, {sat_en}, {bp_en}" + (", completely free of any green-screen tint" if is_green_screen_multi else "")
 
     if len(loaded_frames) == 1 or avg_motion < 0.35:
         motion_vi = "Máy quay rất tĩnh / gần như cố định"
@@ -675,80 +853,84 @@ def analyze_video_optical_profile(
 
     if shot_kind == "portrait_medium":
         bg_scale_rule_vi = (
-            f"Chủ thể chiếm ~{hand_w_pct}%×{hand_h_pct}% khung ở khoảng trung cảnh {est_dist_label} -> "
-            f"nội thất/ghế/kệ ngay phía sau và cảnh ở xa 3–6m phải đúng tỷ lệ góc nhìn {base['focal_length_mm']}mm."
+            f"Chủ thể chiếm ~{hand_w_pct}%×{hand_h_pct}% khung ({orient_vi}) ở khoảng trung cảnh {est_dist_label} -> "
+            f"nội thất/ghế/kệ ngay phía sau (1.8–3m) và cảnh xa (4–7m) phải đúng tỷ lệ góc nhìn {base['focal_length_mm']}mm."
         )
         bg_scale_rule_en = (
-            f"Because the medium-framed foreground subject occupies ~{hand_w_pct}%x{hand_h_pct}% of the frame at {est_dist_label} "
-            f"({wrist_en}), align mid-ground furniture/shelves (1.8–3m away) and distant architectural elements (4–8m away) "
-            f"to a natural {base['focal_length_mm']}mm perspective with consistent floor/horizon geometry."
+            f"Because the medium-framed foreground subject occupies ~{hand_w_pct}%x{hand_h_pct}% of the frame ({orient_en}) at {est_dist_label} "
+            f"({wrist_en}), scale mid-ground furniture/shelves (1.8–3m away) and distant architectural elements (4–7m away) "
+            f"naturally to a {base['focal_length_mm']}mm perspective with matching eye-level horizon geometry."
         )
     else:
         bg_scale_rule_vi = (
-            f"Chủ thể tiền cảnh rộng ~{hand_w_pct}% khung ở khoảng cách {est_dist_label} -> "
-            f"bàn/vật dụng cách ~1.2–2.5m và hậu cảnh xa 3–5m phải có kích thước nhỏ đúng phối cảnh {base['focal_length_mm']}mm."
+            f"Chủ thể/tay tiền cảnh chiếm ~{hand_w_pct}%×{hand_h_pct}% khung ({orient_vi}) ở cự ly gần {est_dist_label} -> "
+            f"vật thể trung cảnh (1.5–2.5m) và người/nội thất hậu cảnh (3–5m) phải có kích thước đủ gần tự nhiên đúng ống kính {base['focal_length_mm']}mm (tránh quá nhỏ xa tít)."
         )
         bg_scale_rule_en = (
-            f"Because the foreground subject occupies ~{hand_w_pct}% frame width at {est_dist_label} distance "
-            f"({wrist_en}), keep mid-ground tables/surfaces (1.5–2.5m away) and distant people/architecture (3–6m away) "
-            f"accurately scaled to a real {base['focal_length_mm']}mm lens perspective — never oversized close-up props right behind the subject."
+            f"Because the close-up foreground subject/hand occupies ~{hand_w_pct}%x{hand_h_pct}% of the frame ({orient_en}) at {est_dist_label} distance "
+            f"({wrist_en}), place real-world mid-ground surfaces/furniture (~1.5–2.5m away) and background people/architecture (~3–5m away) "
+            f"at natural medium-close {base['focal_length_mm']}mm smartphone scale — neither tiny distant wide-angle miniatures nor blocking the center foreground."
         )
 
     vision_notes = _estimate_vision_notes(loaded_frames) if use_vision_ai else ""
-    analysis_mode = f"Multi-Frame CV ({len(loaded_frames)} khung)" + (" + Vision AI" if vision_notes else "")
+    analysis_mode = f"Multi-Frame CV ({len(loaded_frames)} khung)" + (" + Vision AI" if vision_notes else " · Offline 0 Token")
 
     horizon_pct = int(round(np.clip(52.0 - (base["camera_pitch_deg"] + 10) * 0.6, 38.0, 58.0)))
     telemetry_cards = [
         {
             "id": "lens_scale",
             "icon": "📐",
-            "title": "Tiêu cự & Tỷ lệ chủ thể",
-            "value": f"{base['focal_length_mm']}mm · {est_dist_label} · Chủ thể ~{hand_w_pct}%",
-            "detail": bg_scale_rule_vi,
+            "title": "Kích thước, Hướng & Tỷ lệ chủ thể",
+            "value": f"Rộng {hand_w_pct}% × Cao {hand_h_pct}% · {orient_vi} · {est_dist_label}",
+            "detail": f"{wrist_vi}. {bg_scale_rule_vi}",
         },
         {
             "id": "camera_angle",
             "icon": "🎥",
-            "title": "Góc máy & Chuyển động",
-            "value": f"Nghiêng {base['camera_pitch_deg']}° · Chân trời ~{horizon_pct}% · {base['active_aspect_ratio']}",
-            "detail": f"{wrist_vi}. {motion_vi}.",
+            "title": "Tiêu cự, Góc máy & Chuyển động",
+            "value": f"{base['focal_length_mm']}mm · Nghiêng {base['camera_pitch_deg']}° · Chân trời ~{horizon_pct}%",
+            "detail": f"{base['active_aspect_ratio']}. {motion_vi}.",
         },
         {
             "id": "key_light",
             "icon": "☀️",
-            "title": "Hướng sáng chủ thể & Bóng đổ",
+            "title": "Hướng sáng & Chiều đổ bóng",
             "value": light_dir_vi,
             "detail": f"{shadow_vi}. {hard_vi}.",
         },
         {
-            "id": "exposure_kelvin",
-            "icon": "🌡️",
-            "title": "Nhiệt độ màu & Phơi sáng",
-            "value": f"~{kelvin_est}K · Luma {int(mean_luma)}",
-            "detail": exp_vi,
+            "id": "color_tone",
+            "icon": "🎨",
+            "title": "Màu sắc, Tone & Điểm đen",
+            "value": f"~{kelvin_est}K · {tone_temp_vi} · Luma {int(mean_luma)}",
+            "detail": f"{color_tone_vi}. {exp_vi}.",
         },
         {
-            "id": "dof_grain",
+            "id": "sharp_dof",
             "icon": "🔍",
-            "title": "Độ nét, Độ mờ nền & Hạt nhiễu",
-            "value": f"{aperture_est} · Blur ~{bg_blur_sigma}px · Grain {grain_sigma:.3f}",
-            "detail": base["bokeh_blur_level"],
+            "title": "Độ nét, Độ mờ nền & Nhiễu hạt (ISO)",
+            "value": f"{aperture_est} · Mờ ~{bg_blur_sigma}px · ISO ~{iso_est} · Grain {grain_sigma:.3f}",
+            "detail": f"{sharp_vi}. {noise_vi}.",
         },
         {
             "id": "mode",
             "icon": "🤖",
             "title": "Phân tích đa khung hình",
             "value": analysis_mode,
-            "detail": vision_notes or f"Đã quét đồng bộ các frame {sampled_indices} để chống lệch góc sáng và tỷ lệ vật thể.",
+            "detail": vision_notes or f"Đã đo đồng bộ {len(loaded_frames)} frame ({sampled_indices}) trên vùng chủ thể thật để tạo nền khớp màu & độ nhiễu ngay từ gốc.",
         },
     ]
 
     profile = dict(base)
     profile.update({
         "sampled_indices": sampled_indices,
+        "is_green_screen": is_green_screen_multi,
         "foreground_occupancy_pct": fg_occ_pct,
         "hand_width_pct": hand_w_pct,
         "hand_height_pct": hand_h_pct,
+        "subject_orientation_deg": orient_deg,
+        "subject_orientation_vi": orient_vi,
+        "subject_orientation_en": orient_en,
         "wrist_entry_vi": wrist_vi,
         "wrist_entry_en": wrist_en,
         "lighting_direction": light_dir_vi,
@@ -761,9 +943,22 @@ def analyze_video_optical_profile(
         "exposure_vi": exp_vi,
         "exposure_en": exp_en,
         "kelvin_est": kelvin_est,
+        "black_point_p5": black_p5,
+        "white_point_p95": white_p95,
+        "saturation_med": sat_med,
+        "tint_a_shift": tint_a,
+        "color_tone_vi": color_tone_vi,
+        "color_tone_en": color_tone_en,
+        "fg_sharpness": fg_sharp_val,
+        "sharpness_vi": sharp_vi,
+        "sharpness_en": sharp_en,
         "bg_blur_sigma_px": bg_blur_sigma,
         "aperture_est": aperture_est,
         "grain_sigma": grain_sigma,
+        "chroma_noise_sigma": chroma_noise,
+        "iso_est": iso_est,
+        "noise_vi": noise_vi,
+        "noise_en": noise_en,
         "camera_motion_px": avg_motion,
         "camera_motion_vi": motion_vi,
         "camera_motion_en": motion_en,
@@ -789,14 +984,17 @@ def _craft_matched_environment_via_llm(
         "describing ONLY the empty real-world environment and background props scaled accurately to match the camera telemetry. "
         "Never include hands, phones, or foreground objects in the description. Output ONLY English prose."
     )
+    color_tone_str = profile.get("color_tone_en") or f"~{profile.get('kelvin_est', 5400)}K"
     user_msg = (
         f"Vietnamese Background Idea: {target_background_vi}\n"
         f"Foreground Subject to Composite Later: {subject_description_vi}\n"
-        f"Optical Profile: {profile['aspect_ratio_en']}, {profile['focal_length_mm']}mm smartphone lens, "
+        f"Optical & Color Profile: {profile['aspect_ratio_en']}, {profile['focal_length_mm']}mm smartphone lens, "
         f"{profile['camera_angle_en']}, {profile['bg_scale_rule_en']}, "
         f"{profile['lighting_en']}, {profile['shadow_direction_en']}, {profile['light_hardness_en']}, "
-        f"~{profile['kelvin_est']}K, {profile['exposure_en']}, {profile['aperture_est']} subtle DoF (~{profile['bg_blur_sigma_px']}px), "
-        f"{profile['camera_motion_en']}. Vision note: {profile.get('vision_notes') or 'none'}."
+        f"Color & Tone: {color_tone_str}, {profile['exposure_en']}, "
+        f"Sharpness & DoF: {profile.get('sharpness_en') or ''}, {profile['aperture_est']} subtle DoF (~{profile['bg_blur_sigma_px']}px), "
+        f"Noise: {profile.get('noise_en') or 'fine organic sensor grain'}, "
+        f"Motion: {profile['camera_motion_en']}. Vision note: {profile.get('vision_notes') or 'none'}."
     )
     payload = {
         "model": LOCAL_ROUTER_MODEL,
@@ -851,6 +1049,9 @@ def generate_matched_background_prompts(
     hard_en = profile.get("light_hardness_en") or "natural semi-diffused light"
     exp_en = profile.get("exposure_en") or "balanced natural auto-exposure"
     kelvin_est = profile.get("kelvin_est", 5400)
+    color_tone_en = profile.get("color_tone_en") or f"neutral ~{kelvin_est}K daylight color tone"
+    sharp_en = profile.get("sharpness_en") or "natural consumer smartphone optical sharpness"
+    noise_en = profile.get("noise_en") or "subtle organic smartphone sensor grain"
     aperture_est = profile.get("aperture_est", "f/2.2")
     bg_blur = profile.get("bg_blur_sigma_px", 1.2)
     motion_en = profile.get("camera_motion_en") or "subtle organic natural camera motion"
@@ -860,32 +1061,33 @@ def generate_matched_background_prompts(
         f"Photorealistic clean empty background plate video in {profile['aspect_ratio_en']}, "
         f"{profile['scale_calibration_en']}. "
         f"Depict {ai_bg_en}, with a completely open, unobstructed empty foreground (strictly NO people, NO hands, NO held objects in the center foreground plane). "
-        f"Scale rule: {scale_en} "
-        f"Lighting & Shadows: match {profile['lighting_en']} at ~{kelvin_est}K with {hard_en}, {shadow_en}, and {exp_en}. "
-        f"Optics & Motion: authentic natural camera capture ({profile['focal_length_mm']}mm {aperture_est}), focus plane around {dist_focus} so the background sits at subtle natural ~{bg_blur}px optical softness with authentic fine sensor grain (NO artificial CGI gloss), and {motion_en}."
+        f"Scale & Framing: {scale_en} "
+        f"Lighting, Color & Tone: match {profile['lighting_en']} with {color_tone_en}, {hard_en}, {shadow_en}, and {exp_en} so foreground subjects composite seamlessly with minimal color grading. "
+        f"Optics, Sharpness & Sensor Noise: {profile['focal_length_mm']}mm {aperture_est} focused around {dist_focus}, {sharp_en}, background sitting at ~{bg_blur}px gentle optical softness with {noise_en} (strictly NO glossy CGI or synthetic AI hyper-sharpness), and {motion_en}."
     )
 
     v2v_prompt = (
         f"Video-to-video background replacement in {profile['aspect_ratio_en']}, {profile['scale_calibration_en']}. "
         f"KEEP {subj_en} 100% intact with identical silhouette, details, surface texture, and original motion. "
         f"CHANGE only the environment behind the foreground into {ai_bg_en}, strictly obeying the perspective rule: {scale_en} "
-        f"Match illumination with {profile['lighting_en']} (~{kelvin_est}K), {hard_en}, {shadow_en}, {exp_en}, "
-        f"and {aperture_est} natural background softness (~{bg_blur}px) with fine sensor grain and temporal frame-to-frame stability."
+        f"Match illumination and grading with {profile['lighting_en']}, {color_tone_en}, {hard_en}, {shadow_en}, {exp_en}. "
+        f"Render background optics at {aperture_est} (~{bg_blur}px natural softness) matching {sharp_en} and {noise_en}, with strict temporal frame-to-frame stability."
     )
 
     still_bg_prompt = (
         f"Authentic candid photograph of an empty background scene in {profile['aspect_ratio_en']}, "
         f"{profile['scale_calibration_en']}. Scene: {ai_bg_en}, completely unobstructed empty foreground (no subject blocking center foreground). "
-        f"{scale_en} Illuminated by {profile['lighting_en']} at ~{kelvin_est}K with {hard_en}, {shadow_en}, and {exp_en}. "
-        f"Captured at {profile['focal_length_mm']}mm {aperture_est} focused at {dist_focus} so background architecture and objects have ~{bg_blur}px gentle optical softness and realistic fine sensor grain."
+        f"{scale_en} Illuminated by {profile['lighting_en']} with {color_tone_en}, {hard_en}, {shadow_en}, and {exp_en}. "
+        f"Captured at {profile['focal_length_mm']}mm {aperture_est} focused at {dist_focus} with {sharp_en}, ~{bg_blur}px gentle background softness, and {noise_en}."
     )
 
     full_markdown = (
-        f"### Phân Tích Quang Học ({profile.get('analysis_mode', 'Multi-Frame')})\n"
-        f"- **Tiêu cự & Tỷ lệ chủ thể:** `{profile['focal_length_mm']}mm`, rộng ~`{profile.get('hand_width_pct', profile['foreground_occupancy_pct'])}%` ở `{dist_focus}` — {profile.get('bg_scale_rule_vi', profile['scale_calibration_vi'])}\n"
+        f"### Phân Tích Quang Học & Màu Sắc ({profile.get('analysis_mode', 'Multi-Frame')})\n"
+        f"- **Kích thước, Hướng & Tỷ lệ chủ thể:** `{profile['focal_length_mm']}mm`, rộng ~`{profile.get('hand_width_pct', profile['foreground_occupancy_pct'])}%` × cao ~`{profile.get('hand_height_pct', 50)}%` ({profile.get('subject_orientation_vi', 'thẳng')}) ở `{dist_focus}` — {profile.get('bg_scale_rule_vi', profile['scale_calibration_vi'])}\n"
         f"- **Hướng sáng & Bóng đổ:** `{profile['lighting_direction']}` — {profile.get('shadow_direction_vi', '')} ({profile.get('light_hardness_vi', '')})\n"
-        f"- **Nhiệt độ màu & Phơi sáng:** `~{kelvin_est}K` | {profile.get('exposure_vi', '')}\n"
-        f"- **Độ mờ hậu cảnh & Chuyển động:** `{aperture_est}` (~`{bg_blur}px` blur), Grain `{profile.get('grain_sigma', 0.01):.3f}`, {profile.get('camera_motion_vi', '')}\n"
+        f"- **Màu sắc, Tone & Điểm đen:** `~{kelvin_est}K` | {profile.get('color_tone_vi', '')} | {profile.get('exposure_vi', '')}\n"
+        f"- **Độ nét & Độ mờ hậu cảnh:** `{aperture_est}` (~`{bg_blur}px` blur) | {profile.get('sharpness_vi', '')}\n"
+        f"- **Độ nhiễu hạt (Noise/ISO) & Chuyển động:** {profile.get('noise_vi', '')} | {profile.get('camera_motion_vi', '')}\n"
         + (f"- **Nhận xét Vision AI:** {profile['vision_notes']}\n" if profile.get("vision_notes") else "")
     )
 

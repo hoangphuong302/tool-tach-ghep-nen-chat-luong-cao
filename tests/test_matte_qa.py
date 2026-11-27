@@ -473,3 +473,143 @@ def test_tilted_device_over_shadowed_green_and_wood_never_adds_background_triang
         saved_alpha = sess.birefnet_alpha_by_frame[0]
         assert int(np.sum((saved_alpha >= 0.5) & (alpha_clean < 0.5))) == 0
         assert int(np.sum((saved_alpha < 0.5) & (alpha_clean >= 0.5))) == 0
+
+
+def test_pymatting_preserves_thin_dark_side_button_while_despilling_green_halo() -> None:
+    """Thin dark side button at alpha ~0.92 next to a bright white bezel must NOT be bleached white by PyMatting."""
+    h, w = 260, 220
+    bgr = np.full((h, w, 3), (45, 180, 42), dtype=np.uint8)  # chroma green background
+    alpha = np.zeros((h, w), dtype=np.float32)
+
+    # Device body + bright white right bezel
+    bgr[30:230, 50:155] = (25, 25, 30)
+    bgr[30:230, 140:158] = (242, 244, 246)
+    alpha[30:230, 50:158] = 1.0
+
+    # Thin 4px black volume rocker right outside white bezel with near-opaque neural alpha (~0.90)
+    bgr[75:145, 158:163] = (24, 24, 28)
+    alpha[75:145, 158:163] = 0.90
+
+    # 2px translucent green-contaminated edge fringe outside the button (alpha=0.35)
+    bgr[75:145, 163:165] = (48, 138, 46)
+    alpha[75:145, 163:165] = 0.35
+
+    out = estimate_foreground_pymatting(bgr, alpha, strength=0.95, despill_green=True, fast_preview=True)
+    # Dark button must stay dark (< 75 mean luma), never bleached white by neighboring bezel diffusion
+    btn_luma = float(np.mean(out[80:140, 159:162]))
+    assert btn_luma < 75.0, f"Dark side button was washed out to luma={btn_luma:.1f}!"
+    # Translucent outer fringe must have its green spill suppressed
+    fringe = out[80:140, 163:165].astype(np.float32)
+    fringe_g_exc = float(np.mean(fringe[..., 1] - np.maximum(fringe[..., 0], fringe[..., 2])))
+    assert fringe_g_exc < 12.0, f"Green fringe remained: {fringe_g_exc:.1f}"
+
+
+def test_background_transform_grade_and_reverse_source_match_in_preview(tmp_path: Path, monkeypatch) -> None:
+    from fastapi.testclient import TestClient
+
+    import studio_server
+    from src.relight_harmonizer import grade_and_match_background, transform_background_frame
+
+    # 1. Transform scale + offset shifts a landmark cleanly with zero black border artifacts
+    bg = np.full((180, 120, 3), (60, 75, 90), dtype=np.uint8)
+    cv2.circle(bg, (60, 90), 16, (40, 220, 240), -1)  # bright yellow center marker
+    tr_default = transform_background_frame(bg, 120, 180, scale=1.0, offset_x=0.0, offset_y=0.0)
+    tr_zoom_pan = transform_background_frame(bg, 120, 180, scale=1.6, offset_x=0.22, offset_y=-0.18)
+    assert tr_zoom_pan.shape == (180, 120, 3)
+    assert float(np.mean(np.abs(tr_zoom_pan.astype(np.float32) - tr_default.astype(np.float32)))) > 5.0
+    # Center marker shifted up-right into quadrant (x > 65, y < 80)
+    assert float(np.max(tr_zoom_pan[:85, 65:, 2])) > 180.0
+
+    # 2. Reverse match (BG -> Source) pulls dark cool BG toward warm bright source subject
+    fg_warm = np.full((120, 120, 3), (120, 165, 215), dtype=np.uint8)
+    fg_mask = np.zeros((120, 120), dtype=np.uint8)
+    fg_mask[20:100, 20:100] = 1
+    bg_dark_cool = np.full((120, 120, 3), (95, 70, 50), dtype=np.uint8)
+    bg_matched = grade_and_match_background(bg_dark_cool, fg_warm, fg_mask, match_source_strength=0.9)
+    assert float(np.mean(bg_matched)) > float(np.mean(bg_dark_cool)) + 20.0
+    # Warmth (R - B) moves positively toward warm source
+    assert float(np.mean(bg_matched[..., 2].astype(float) - bg_matched[..., 0].astype(float))) > float(
+        np.mean(bg_dark_cool[..., 2].astype(float) - bg_dark_cool[..., 0].astype(float))
+    ) + 12.0
+
+    # 3. Preview endpoint accepts all new BG params and visibly changes output
+    store = studio_server.SessionStore(base_dir=tmp_path / "sessions", ttl_seconds=600)
+    monkeypatch.setattr(studio_server, "STORE", store)
+    client = TestClient(studio_server.app)
+    sid = client.post("/matting/api/session").json()["session_id"]
+    sess = store.get(sid)
+
+    src = np.full((180, 120, 3), (45, 175, 42), dtype=np.uint8)
+    src[60:150, 30:90] = (125, 160, 210)
+    _, sb = cv2.imencode(".png", src)
+    _, bb = cv2.imencode(".png", bg)
+    for role, raw, fn in (("source", sb.tobytes(), "s.png"), ("background", bb.tobytes(), "b.png")):
+        ui = client.post(f"/matting/api/session/{sid}/upload/init", json={"role": role, "filename": fn, "total_size": len(raw)})
+        uid = ui.json()["upload_id"]
+        client.put(f"/matting/api/session/{sid}/upload/{uid}/chunk?index=0", content=raw)
+        client.post(f"/matting/api/session/{sid}/upload/{uid}/complete")
+
+    a = np.zeros((180, 120), dtype=np.float32)
+    a[60:150, 30:90] = 1.0
+    studio_server._save_confirmed_mask(sess, 0, (a >= 0.5).astype(np.uint8), push_undo=False)
+    sess.birefnet_alpha_by_frame[0] = a
+
+    import base64
+
+    def _dec(url: str) -> np.ndarray:
+        return cv2.imdecode(np.frombuffer(base64.b64decode(url.split(",", 1)[1]), dtype=np.uint8), cv2.IMREAD_COLOR)
+
+    r0 = client.post(f"/matting/api/session/{sid}/preview", json={"frame_idx": 0, "use_pymatting_fg": False})
+    r1 = client.post(
+        f"/matting/api/session/{sid}/preview",
+        json={
+            "frame_idx": 0,
+            "use_pymatting_fg": False,
+            "bg_scale": 1.65,
+            "bg_offset_x": 0.20,
+            "bg_offset_y": -0.15,
+            "bg_match_source": 0.85,
+            "bg_brightness": 0.15,
+            "bg_temperature": 0.4,
+        },
+    )
+    assert r0.status_code == 200 and r1.status_code == 200
+    diff_bg = float(np.mean(np.abs(_dec(r1.json()["right_b64"])[:50, :].astype(np.float32) - _dec(r0.json()["right_b64"])[:50, :].astype(np.float32))))
+    assert diff_bg > 15.0
+
+
+def test_optical_prompt_measures_noise_sharpness_tone_and_orientation_on_green_screen() -> None:
+    """Green-screen video telemetry must measure real foreground sensor noise, tone/Kelvin, sharpness, and tilt."""
+    rng = np.random.default_rng(7)
+    h, w = 320, 200
+    frames = []
+    masks = []
+    for _ in range(3):
+        # Perfectly flat compressed green screen exterior (zero noise on BG!)
+        bgr = np.full((h, w, 3), (45, 178, 42), dtype=np.uint8)
+        fg_mask = np.zeros((h, w), dtype=np.uint8)
+        # Tilted right (~14 deg) warm subject with authentic camera sensor noise
+        pts = np.array([[78, 70], [142, 86], [116, 260], [52, 244]], dtype=np.int32)
+        cv2.fillConvexPoly(fg_mask, pts, 255)
+        subj_patch = np.full((h, w, 3), (118, 156, 208), dtype=np.float32)
+        subj_patch += rng.normal(0.0, 5.5, size=(h, w, 3)).astype(np.float32)
+        bgr[fg_mask > 0] = np.clip(subj_patch[fg_mask > 0], 0, 255).astype(np.uint8)
+        frames.append(bgr)
+        masks.append(fg_mask)
+
+    profile = analyze_video_optical_profile(frames, fg_masks=masks, sample_count=3, use_vision_ai=False)
+    assert profile["is_green_screen"] is True
+    assert profile["grain_sigma"] > 0.006, f"Expected real FG sensor noise, got {profile['grain_sigma']}"
+    assert profile["subject_orientation_deg"] > 5.0
+    assert profile["iso_est"] >= 400
+    card_ids = {c["id"] for c in profile["telemetry_cards"]}
+    assert {"lens_scale", "camera_angle", "key_light", "color_tone", "sharp_dof", "mode"} == card_ids
+
+    prompts = generate_matched_background_prompts(
+        profile,
+        target_background_vi="Sảnh sân bay quốc tế hiện đại có ánh sáng tự nhiên",
+        subject_description_vi="Bàn tay cầm máy phiên dịch",
+        use_local_llm=False,
+    )
+    cp = prompts["clean_plate_prompt"].lower()
+    assert "iso" in cp and "k" in cp and "tilted" in cp and "softness" in cp
