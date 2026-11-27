@@ -965,7 +965,7 @@ def auto_cut_universal_hybrid(
          (e.g., white book pages against light walls or straight metallic edges).
     """
     from src.alpha_matting import refine_alpha_edge_controls
-    from src.matte_qa import heal_universal_structural_defects
+    from src.matte_qa import heal_universal_structural_defects, is_green_screen_scene
     from src.neural_matting import release_neural_models, run_birefnet_matting
 
     h, w = src_bgr.shape[:2]
@@ -987,7 +987,7 @@ def auto_cut_universal_hybrid(
     if fg_frac < 0.008 or fg_frac > 0.94:
         return mask_bi, alpha_bi
 
-    # Universal BiRefNet + SAM 2.1 completeness fusion (box + core/background anchors)
+    # Universal BiRefNet + SAM 2.1 completeness fusion (box + core/near-ring background anchors)
     ys, xs = np.where(mask_bi > 0)
     bx0, by0 = max(0, int(xs.min()) - 8), max(0, int(ys.min()) - 8)
     bx1, by1 = min(w, int(xs.max()) + 9), min(h, int(ys.max()) + 9)
@@ -1004,7 +1004,15 @@ def auto_cut_universal_hybrid(
                 break
 
     ext_zone = cv2.dilate((alpha_bi >= 0.20).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (33, 33))) == 0
-    ny, nx = np.where(ext_zone)
+    near_bg_ring = (
+        (cv2.dilate(mask_bi, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (65, 65))) > 0)
+        & (cv2.dilate(mask_bi, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 19))) == 0)
+        & (alpha_bi <= 0.08)
+    )
+    bg_anchor_zone = near_bg_ring if int(np.sum(near_bg_ring)) >= 40 else ext_zone
+    ny, nx = np.where(bg_anchor_zone)
+    if len(nx) == 0:
+        ny, nx = np.where(ext_zone)
     neg_pts: List[List[float]] = []
     if len(nx) > 0:
         step = max(1, len(nx) // 6)
@@ -1012,9 +1020,6 @@ def auto_cut_universal_hybrid(
             neg_pts.append([float(nx[i]), float(ny[i])])
             if len(neg_pts) >= 6:
                 break
-        bg_lab_med = np.median(lab[ny[::max(1, len(nx) // 200)], nx[::max(1, len(nx) // 200)]], axis=0)
-    else:
-        bg_lab_med = None
 
     mask_out = mask_bi
     alpha_out = alpha_bi
@@ -1059,6 +1064,15 @@ def auto_cut_universal_hybrid(
         n_rc, l_rc, st_rc, _ = cv2.connectedComponentsWithStats(cand_rec, connectivity=8)
         recovered = np.zeros((h, w), dtype=np.uint8)
         max_rec_area = int(np.sum(mask_bi > 0) * 0.35)
+
+        is_green_bg = is_green_screen_scene(src_bgr, alpha_bi)
+        hsv = cv2.cvtColor(src_bgr, cv2.COLOR_BGR2HSV)
+        b_ch, g_ch, r_ch = (src_bgr[..., 0].astype(np.float32), src_bgr[..., 1].astype(np.float32), src_bgr[..., 2].astype(np.float32))
+        g_exc = g_ch - np.maximum(b_ch, r_ch)
+        w_lab_c = np.array([0.45, 1.25, 1.25], dtype=np.float32)
+        k55 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (55, 55))
+        k13 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
+
         for cid in range(1, n_rc):
             area = int(st_rc[cid, cv2.CC_STAT_AREA])
             if area < 64 or area > max_rec_area:
@@ -1066,10 +1080,29 @@ def auto_cut_universal_hybrid(
             comp = l_rc == cid
             if not np.any(comp & touch_bi):
                 continue
-            if bg_lab_med is not None:
-                mean_d = float(np.mean(np.linalg.norm(lab[comp] - bg_lab_med, axis=1)))
-                if mean_d < 9.0:
+
+            # Block shadowed green-screen cloth leakage immediately on green-screen scenes
+            if is_green_bg:
+                comp_g_med = float(np.median(g_exc[comp]))
+                green_ratio = float(np.mean((hsv[..., 0][comp] >= 32) & (hsv[..., 0][comp] <= 100) & (hsv[..., 1][comp] >= 28)))
+                if comp_g_med > 10.0 and green_ratio > 0.35:
                     continue
+
+            # Universal local background vs foreground Lab check (exclude candidate parts from bg sample)
+            comp_u8 = comp.astype(np.uint8)
+            local_bg = (cv2.dilate(comp_u8, k55) > 0) & (cand_rec == 0) & (alpha_bi <= 0.08)
+            if int(np.sum(local_bg)) < 20:
+                local_bg = ext_zone
+            if np.any(local_bg):
+                bg_vals = lab[local_bg]
+                bg_q = np.percentile(bg_vals, [20, 50, 80], axis=0) if len(bg_vals) >= 6 else np.median(bg_vals, axis=0)[None, :]
+                comp_med = np.median(lab[comp], axis=0)
+                d_bg = float(np.min(np.linalg.norm((bg_q - comp_med[None, :]) * w_lab_c[None, :], axis=1)))
+                local_fg = (cv2.dilate(comp_u8, k13) > 0) & (alpha_bi >= 0.75)
+                d_fg = float(np.linalg.norm((np.median(lab[local_fg], axis=0) - comp_med) * w_lab_c)) if np.any(local_fg) else 1e9
+                if d_bg < 22.0 or (d_bg < 38.0 and d_bg < d_fg * 1.05):
+                    continue
+
             recovered[comp] = 1
 
         if np.any(recovered > 0):

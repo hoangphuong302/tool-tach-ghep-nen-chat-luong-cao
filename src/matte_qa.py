@@ -297,30 +297,68 @@ def heal_universal_structural_defects(
     if is_green_bg:
         from src.relight_harmonizer import detect_emissive_screen_mask
 
+        ext_strong_green = ext_zone & (g_exc > 15.0) & (hsv[..., 0] >= 32) & (hsv[..., 0] <= 96) & (hsv[..., 1] >= 35)
+        if np.any(ext_strong_green):
+            ext_g_med = float(np.median(g_exc[ext_strong_green]))
+            ext_s_med = float(np.median(hsv[..., 1][ext_strong_green]))
+            ext_a_vals = lab[..., 1][ext_strong_green]
+            ext_b_vals = lab[..., 2][ext_strong_green]
+            ext_a_p85 = float(np.percentile(ext_a_vals, 85))
+            v_ext = np.array([float(np.median(ext_a_vals)) - 128.0, float(np.median(ext_b_vals)) - 128.0], dtype=np.float32)
+        else:
+            ext_g_med = 40.0
+            ext_s_med = 80.0
+            ext_a_p85 = 110.0
+            v_ext = np.array([-30.0, 20.0], dtype=np.float32)
+        v_ext_norm = max(float(np.linalg.norm(v_ext)), 1e-4)
+
         fg_bin_now = (a_f >= 0.45).astype(np.uint8)
         fg_area = max(1, int(np.sum(fg_bin_now > 0)))
         screen_raw = detect_emissive_screen_mask(bgr, fg_bin_now)
         screen_protect = cv2.dilate(screen_raw, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))) > 0
 
+        min_g_exc = max(15.0, min(32.0, 0.25 * ext_g_med))
+        min_sat = max(42.0, min(68.0, 0.35 * ext_s_med))
+        max_lab_a = 115.0
+
         crevice_cand = (
             (a_f > 0.04)
             & (~screen_protect)
-            & (g_exc > 7.0)
-            & (hsv[..., 0] >= 30)
-            & (hsv[..., 0] <= 104)
-            & (hsv[..., 1] >= 18)
-            & (lab[..., 1] < 124.0)
+            & (g_exc > min_g_exc)
+            & (hsv[..., 0] >= 36)
+            & (hsv[..., 0] <= 90)
+            & (hsv[..., 1] >= min_sat)
+            & (lab[..., 1] <= max_lab_a)
         )
         if np.any(crevice_cand):
             ext_loose = (a_f <= 0.12).astype(np.uint8)
             near_ext = cv2.dilate(ext_loose, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (85, 85))) > 0
+            k9 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
             n_cr, l_cr, st_cr, _ = cv2.connectedComponentsWithStats(crevice_cand.astype(np.uint8), connectivity=8)
-            max_cr_area = max(16, int(0.06 * fg_area))
+            max_cr_area = max(48, int(0.06 * fg_area))
             for cid in range(1, n_cr):
                 c_area = int(st_cr[cid, cv2.CC_STAT_AREA])
-                if c_area < 6:
+                if c_area < 32:
                     continue
                 comp = l_cr == cid
+                comp_g = float(np.median(g_exc[comp]))
+                comp_s = float(np.median(hsv[..., 1][comp]))
+                comp_a = float(np.median(lab[..., 1][comp]))
+                if comp_g < 18.0 or comp_s < 46.0 or comp_a > 114.0:
+                    continue
+
+                v_comp = np.array([comp_a - 128.0, float(np.median(lab[..., 2][comp])) - 128.0], dtype=np.float32)
+                v_comp_norm = max(float(np.linalg.norm(v_comp)), 1e-4)
+                cos_ext = float(np.dot(v_comp, v_ext) / (v_comp_norm * v_ext_norm))
+                if cos_ext < 0.70:
+                    continue
+
+                fg_ring = (cv2.dilate(comp.astype(np.uint8), k9) > 0) & (a_f >= 0.5) & (~crevice_cand)
+                if np.any(fg_ring):
+                    fg_g_med = float(np.median(g_exc[fg_ring]))
+                    if comp_g <= fg_g_med + 10.0:
+                        continue
+
                 if np.any(comp & near_ext) or c_area <= max_cr_area:
                     punch_mask[comp] = 1
 

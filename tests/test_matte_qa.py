@@ -310,3 +310,76 @@ def test_pymatting_fast_preview_preserves_core() -> None:
     core = alpha >= 0.996
     # Wait: core has despill check disabled on pure opaque interior (edge_weight is 0 when alpha >= 0.995)
     assert np.array_equal(out[core], bgr[core])
+
+
+def test_green_bounce_on_shadowed_skin_and_white_bezel_never_eaten() -> None:
+    """Green bounce light on shadowed skin or white bezels must NEVER be punched out; real green cloth slits still clean."""
+    h, w = 240, 240
+    bgr = np.full((h, w, 3), (45, 175, 42), dtype=np.uint8)
+    alpha = np.zeros((h, w), dtype=np.float32)
+
+    # Device chassis + blue screen + reflective white rim
+    bgr[35:200, 65:158] = (24, 24, 28)
+    bgr[48:170, 74:148] = (145, 55, 25)
+    bgr[35:200, 152:159] = (198, 212, 200)  # white metal bezel with subtle green spill
+    alpha[35:200, 65:159] = 1.0
+
+    # Hand + shadowed thumb edge with strong green bounce spill
+    bgr[125:230, 170:215] = (120, 155, 210)
+    bgr[192:235, 90:200] = (120, 155, 210)
+    bgr[140:175, 175:195] = (65, 80, 72)  # shadowed skin with green bounce
+    alpha[125:230, 170:215] = 1.0
+    alpha[192:235, 90:200] = 1.0
+
+    # Real shadowed green-screen cloth slit between white bezel and finger (42 x 10 = 420 px)
+    bgr[135:185, 159:170] = (42, 86, 44)
+    alpha[135:185, 159:170] = 0.90
+
+    healed, _, _ = heal_universal_structural_defects(bgr, alpha)
+    assert float(np.mean(healed[142:173, 176:194])) > 0.95  # shadowed skin preserved 100%
+    assert float(np.mean(healed[60:120, 153:158])) > 0.95   # tinted white bezel preserved 100%
+    assert float(np.mean(healed[142:178, 161:168])) < 0.15  # real green cloth crevice punched out
+
+
+def test_auto_cut_hybrid_rejects_shadowed_green_triangle_and_keeps_real_part(monkeypatch) -> None:
+    from src import neural_matting, segmentation
+
+    h, w = 240, 240
+    bgr = np.full((h, w, 3), (45, 175, 42), dtype=np.uint8)
+    # Main dark device core
+    bgr[50:190, 90:155] = (28, 30, 34)
+    bgr[65:165, 98:148] = (145, 55, 25)
+    # Genuine dropped white bezel strip on right side
+    bgr[55:185, 155:166] = (232, 234, 238)
+    # Shadowed green-screen cloth triangle touching left side of device
+    bgr[120:185, 65:90] = (35, 110, 38)
+
+    def _fake_birefnet(img_bgr, max_size=1024):
+        a = np.zeros((h, w), dtype=np.float32)
+        a[50:190, 90:155] = 0.98
+        return a
+
+    monkeypatch.setattr(neural_matting, "run_birefnet_matting", _fake_birefnet)
+    monkeypatch.setattr(neural_matting, "release_neural_models", lambda keep=None: None)
+
+    class _FakeHybridPredictor:
+        def set_image(self, img):
+            pass
+
+        def predict(self, point_coords=None, point_labels=None, box=None, multimask_output=True):
+            m = np.zeros((1, h, w), dtype=bool)
+            m[0, 50:190, 90:155] = True      # core
+            m[0, 55:185, 155:166] = True     # genuine white bezel strip on right
+            m[0, 120:185, 65:90] = True      # erroneous shadowed green triangle on left
+            return m, np.array([0.92], dtype=np.float32), None
+
+    monkeypatch.setattr(
+        segmentation,
+        "_get_cached_sam2_predictor",
+        lambda *a, **kw: (None, _FakeHybridPredictor(), "cpu", True, ("sig",)),
+    )
+
+    mask_out, alpha_out = segmentation.auto_cut_universal_hybrid(bgr, prefer_best_checkpoint=False)
+    assert float(np.mean(alpha_out[125:180, 68:87])) < 0.15
+    assert float(np.mean(mask_out[125:180, 68:87])) < 0.15
+    assert float(np.mean(alpha_out[60:180, 156:164])) > 0.70

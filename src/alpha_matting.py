@@ -1236,7 +1236,7 @@ def refine_alpha_edge_controls(
             rec_r = max(2, min(band_r, 8))
             rec_dil = cv2.dilate(m_bin, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (rec_r * 2 + 1, rec_r * 2 + 1))) > 0
             recover_ring = edge_band & rec_dil & (a_roi >= 0.06) & (a_roi < 0.99)
-            bleed_ring = edge_band & (a_roi > 0.01) & (a_roi < 0.72)
+            bleed_ring = edge_band & (a_roi > 0.01) & (a_roi < 0.42)
             a_rec = a_roi.copy()
             if np.any(recover_ring):
                 lab_r = lab[recover_ring].astype(np.float32)
@@ -1249,12 +1249,7 @@ def refine_alpha_edge_controls(
                 lab_b = lab[bleed_ring].astype(np.float32)
                 df_b = np.linalg.norm((lab_b - fg_lab[bleed_ring]) * w_lab, axis=-1)
                 db_b = np.linalg.norm((lab_b - bg_lab[bleed_ring]) * w_lab, axis=-1)
-                a_b = a_roi[bleed_ring]
-                bad = np.where(
-                    a_b < 0.48,
-                    (db_b < 15.0) & (df_b > db_b * 1.35 + 3.0),
-                    (db_b < 14.0) & (df_b > db_b * 1.55 + 5.0),
-                )
+                bad = (db_b < 14.0) & (df_b > db_b * 1.40 + 3.5)
                 if np.any(bad):
                     by, bx = np.where(bleed_ring)
                     by, bx = by[bad], bx[bad]
